@@ -31,7 +31,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -48,6 +49,8 @@ DEFAULT_QWEN_MODEL = DEFAULT_OPENVINO_ROOT / "qwen2.5-3b-int4"
 DEFAULT_WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "GPU")
 DEFAULT_QWEN_DEVICE = os.getenv("QWEN_DEVICE", "CPU")
 SAMPLE_RATE = 16000
+LOCAL_BACKEND_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOCAL_BACKEND_OPENER = build_opener(ProxyHandler({}))
 MEDIA_EXTENSIONS = {
     ".aac",
     ".avi",
@@ -60,6 +63,14 @@ MEDIA_EXTENSIONS = {
     ".ogg",
     ".wav",
 }
+
+
+def open_backend_request(request: Request, *, timeout: float):
+    """Open local backend requests without changing global proxy behavior."""
+    host = (urlparse(request.full_url).hostname or "").lower()
+    if host in LOCAL_BACKEND_HOSTS:
+        return LOCAL_BACKEND_OPENER.open(request, timeout=timeout)
+    return urlopen(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -914,7 +925,7 @@ def post_json(
     )
 
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_backend_request(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -935,7 +946,7 @@ def get_json(
     request = Request(url, method="GET")
 
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_backend_request(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

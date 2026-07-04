@@ -1,6 +1,9 @@
 import unittest
 
-from backend.app.agent.knowledge_tree_notes import MarkdownKnowledgeTreeAgent
+from backend.app.agent.knowledge_tree_notes import (
+    MarkdownKnowledgeTreeAgent,
+    markdown_without_whisperlive_subtitles,
+)
 from backend.app.agent.schemas import NotesKnowledgeTreeUpdateRequest
 from backend.app.models import KnowledgeNode, KnowledgeTree
 
@@ -135,6 +138,41 @@ class MarkdownKnowledgeTreeAgentTest(unittest.TestCase):
         self.assertEqual(result.session_title, "Fourier Transform Review")
         self.assertEqual(result.course, "Signals and Systems")
         self.assertIn("No grounded graph items", "\n".join(result.warnings))
+
+    def test_final_snapshot_with_duplicate_markdown_still_extracts_metadata(self) -> None:
+        client = FakeJsonLLMClient(
+            {
+                "session_title": "Fourier Transform Review",
+                "course": "Signals and Systems",
+                "entities": [],
+                "relations": [],
+            }
+        )
+        agent = MarkdownKnowledgeTreeAgent(client)
+        agent.remember_processed("lec_notes", "same_hash")
+        request = NotesKnowledgeTreeUpdateRequest(
+            session_id="lec_notes",
+            snapshot_id="snap_final_meta",
+            markdown="# Classroom Notes\n\n- Fourier transform maps signals to frequency domain.",
+            markdown_hash="same_hash",
+            source_segments=[
+                {
+                    "segment_id": "seg_001",
+                    "start_ts": 1.0,
+                    "end_ts": 3.0,
+                    "text": "Fourier transform maps signals to frequency domain.",
+                }
+            ],
+            update_status="final",
+        )
+
+        result = agent.extract(request, KnowledgeTree(session_id="lec_notes"))
+
+        self.assertIsNone(result.extraction)
+        self.assertFalse(result.failed)
+        self.assertEqual(result.session_title, "Fourier Transform Review")
+        self.assertEqual(result.course, "Signals and Systems")
+        self.assertEqual(len(client.calls), 1)
 
     def test_duplicate_graph_content_skips_second_snapshot(self) -> None:
         client = FakeJsonLLMClient(
@@ -273,6 +311,54 @@ class MarkdownKnowledgeTreeAgentTest(unittest.TestCase):
         self.assertIn("recent_source_subtitle_count: 2", prompt)
         self.assertIn("seg_006", prompt)
         self.assertNotIn("id=seg_001", prompt)
+
+    def test_cloud_prompt_strips_whisperlive_subtitle_appendix(self) -> None:
+        client = FakeJsonLLMClient(
+            {
+                "source_segment_ids": ["seg_001"],
+                "entities": [{"name": "Video Streaming", "type": "topic"}],
+                "relations": [],
+            }
+        )
+        agent = MarkdownKnowledgeTreeAgent(client)
+        request = NotesKnowledgeTreeUpdateRequest(
+            session_id="lec_notes",
+            snapshot_id="snap_strip_subtitles",
+            sequence=5,
+            markdown=(
+                "# WhisperLive Local Classroom Notes\n\n"
+                "## Summary\n\n"
+                "- Video Streaming is the main topic.\n\n"
+                "## WhisperLive Subtitles\n\n"
+                "- `0.00-1.00` (final) Raw subtitle text that should not be sent.\n"
+            ),
+            source_segments=[
+                {
+                    "segment_id": "seg_001",
+                    "start_ts": 0.0,
+                    "end_ts": 1.0,
+                    "text": "Video Streaming is the main topic.",
+                }
+            ],
+        )
+
+        result = agent.extract(request, KnowledgeTree(session_id="lec_notes"))
+
+        self.assertIsNotNone(result.extraction)
+        prompt = client.calls[0]["user_prompt"]
+        self.assertIn("Video Streaming is the main topic", prompt)
+        self.assertNotIn("WhisperLive Subtitles", prompt)
+        self.assertNotIn("Raw subtitle text that should not be sent", prompt)
+        self.assertIn("WhisperLive Subtitles", request.markdown)
+
+    def test_markdown_subtitle_strip_supports_chinese_heading(self) -> None:
+        markdown = "# 笔记\n\n## 摘要\n\n- 要点\n\n## WhisperLive 字幕\n\n- 原始字幕\n"
+
+        stripped = markdown_without_whisperlive_subtitles(markdown)
+
+        self.assertIn("## 摘要", stripped)
+        self.assertNotIn("WhisperLive 字幕", stripped)
+        self.assertNotIn("原始字幕", stripped)
 
     def test_filters_low_value_items_and_reuses_existing_labels(self) -> None:
         client = FakeJsonLLMClient(

@@ -27,6 +27,7 @@ import type { AgentArtifact, GlobalSearchSourceRef } from "./types/agent";
 import type { SessionHistorySummary, WebSocketMessage } from "./types/classroom";
 
 const STATUS_NOTICE_LIMIT = 80;
+const STATUS_NOTICE_AUTO_PIN_DELAY_MS = 5000;
 
 type StatusNotice = {
   id: string;
@@ -52,7 +53,9 @@ function App() {
   // 页面公告流。WebSocket、历史课堂、拍照、结束课堂等运行状态都追加到这里，
   // 保留最近若干条并提供滚动查看，避免一条新提示覆盖掉刚发生的重要事件。
   const [statusMessages, setStatusMessages] = useState<StatusNotice[]>([]);
+  const statusMessageListRef = useRef<HTMLOListElement | null>(null);
   const statusNoticeCounterRef = useRef(0);
+  const statusNoticeAutoPinTimerRef = useRef<number | null>(null);
 
   // 历史课程列表来自 GET /sessions。
   //
@@ -92,6 +95,37 @@ function App() {
     setStatusMessages((current) => [...current, notice].slice(-STATUS_NOTICE_LIMIT));
   }
 
+  function clearStatusNoticeAutoPinTimer() {
+    if (statusNoticeAutoPinTimerRef.current !== null) {
+      window.clearTimeout(statusNoticeAutoPinTimerRef.current);
+      statusNoticeAutoPinTimerRef.current = null;
+    }
+  }
+
+  function scrollStatusNoticesToLatest(behavior: ScrollBehavior = "smooth") {
+    statusMessageListRef.current?.scrollTo({ top: 0, behavior });
+  }
+
+  function scheduleStatusNoticeAutoPin() {
+    clearStatusNoticeAutoPinTimer();
+    statusNoticeAutoPinTimerRef.current = window.setTimeout(() => {
+      scrollStatusNoticesToLatest();
+      statusNoticeAutoPinTimerRef.current = null;
+    }, STATUS_NOTICE_AUTO_PIN_DELAY_MS);
+  }
+
+  function handleStatusNoticeScroll() {
+    const list = statusMessageListRef.current;
+    if (!list) {
+      return;
+    }
+    if (list.scrollTop <= 4) {
+      clearStatusNoticeAutoPinTimer();
+      return;
+    }
+    scheduleStatusNoticeAutoPin();
+  }
+
   // 组件卸载时关闭 WebSocket。
   // Vite 热更新、页面跳转或未来加路由时，如果不清理连接，后端还会保留旧订阅者。
   useEffect(() => {
@@ -106,10 +140,24 @@ function App() {
     }
 
     return () => {
+      clearStatusNoticeAutoPinTimer();
       socketRef.current?.close();
       socketRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    const list = statusMessageListRef.current;
+    if (!list || statusMessages.length === 0) {
+      return;
+    }
+
+    if (list.scrollTop <= 4) {
+      scrollStatusNoticesToLatest("auto");
+    } else {
+      scheduleStatusNoticeAutoPin();
+    }
+  }, [statusMessages.length]);
 
   // 刷新历史课程列表。
   //
@@ -224,8 +272,19 @@ function App() {
 
     if (message.type === "post_class.updated") {
       const status = message.data.status;
+      const stage = message.data.post_class_stage;
       setStatusMessage(
-        status === "failed" ? "课后产物生成失败，请稍后查看日志。" : "课后产物已生成。",
+        status === "failed"
+          ? "课后处理失败，请稍后查看日志。"
+          : stage === "notes_ready"
+            ? "结构化笔记已生成，图谱和课后产物继续后台处理。"
+            : stage === "artifacts_ready"
+              ? "课后总结和待办已生成。"
+              : stage === "graph_ready"
+                ? "最终知识图谱已更新。"
+                : stage === "done"
+                  ? "课后处理已完成。"
+                  : "课后处理状态已更新。",
       );
     }
   }
@@ -547,7 +606,7 @@ function App() {
               最近 {statusMessages.length}/{STATUS_NOTICE_LIMIT} 条
             </span>
           </div>
-          <ol>
+          <ol ref={statusMessageListRef} onScroll={handleStatusNoticeScroll}>
             {[...statusMessages].reverse().map((notice) => (
               <li key={notice.id}>
                 <time>{notice.timeLabel}</time>
@@ -589,7 +648,7 @@ function App() {
           <KnowledgeGraphPanel
             focusedSource={focusedSource}
             graph={state.graph}
-            isFinal={state.session?.status === "ended"}
+            status={state.knowledgeGraphStatus}
             transcript={state.transcript}
             visuals={state.visuals}
           />

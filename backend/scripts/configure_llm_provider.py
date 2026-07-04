@@ -28,13 +28,7 @@ LLM_KEYS = (
     "LLM_MAX_RETRIES",
 )
 
-NO_PROXY_VALUE = (
-    "localhost,127.0.0.1,"
-    "api.moonshot.cn,.moonshot.cn,"
-    "api.deepseek.com,.deepseek.com,"
-    "api.openai.com,.openai.com,"
-    "dashscope.aliyuncs.com,.aliyuncs.com"
-)
+NO_PROXY_VALUE = "localhost,127.0.0.1"
 
 
 @dataclass(frozen=True)

@@ -80,6 +80,7 @@ class RealtimeKnowledgeExtractionTest(unittest.IsolatedAsyncioTestCase):
         context_manager.clear()
         knowledge_graph_manager.clear()
         websocket_manager.clear()
+        events_api._latest_transcript_previews.clear()
         events_api.knowledge_extraction_service = self.original_extraction_service
 
     async def test_third_transcript_segment_broadcasts_internal_extraction(self) -> None:
@@ -236,6 +237,35 @@ class RealtimeKnowledgeExtractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(context.transcript[0].is_final)
         self.assertEqual(context.timeline[0].type, "transcript")
         self.assertEqual(event_messages[-1]["data"]["event_type"], "transcript.segment")
+        self.assertNotIn(self.session_id, events_api._latest_transcript_previews)
+
+    async def test_final_transcript_clears_overlapping_preview_cache(self) -> None:
+        await events_api.receive_transcript_preview(
+            events_api.TranscriptPreviewRequest(
+                session_id=self.session_id,
+                payload={
+                    "segment_id": "seg_partial_001",
+                    "start_ts": 10.0,
+                    "end_ts": 14.0,
+                    "text": "preview text",
+                },
+            )
+        )
+
+        await events_api.receive_event(
+            RealtimeEvent(
+                session_id=self.session_id,
+                event_type="transcript.segment",
+                payload={
+                    "segment_id": "seg_final_001",
+                    "start_ts": 9.8,
+                    "end_ts": 14.2,
+                    "text": "preview text.",
+                },
+            )
+        )
+
+        self.assertNotIn(self.session_id, events_api._latest_transcript_previews)
 
 
 if __name__ == "__main__":

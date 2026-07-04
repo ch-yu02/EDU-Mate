@@ -47,14 +47,17 @@ from backend.scripts.whisperlive_qwen_markdown import (  # noqa: E402
     DEFAULT_WHISPERLIVE_HOST,
     DEFAULT_WHISPERLIVE_MODEL,
     DEFAULT_WHISPERLIVE_PORT,
+    DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE,
     BackendSyncer,
     PeriodicMarkdownUpdater,
+    QwenDebugLogger,
     QwenMarkdownPolisher,
     WhisperLiveFileClient,
     WhisperLiveSegment,
     log,
     make_markdown_output_path,
     parse_domain_terms,
+    qwen_debug_log_path,
     transcript_payload,
 )
 
@@ -291,8 +294,12 @@ def iter_microphone_packets(
 
     packet_count = 0
     stopped_by_limit = False
+    stopped_by_event = False
     try:
-        while not stop_event.is_set():
+        while True:
+            if stop_event.is_set():
+                stopped_by_event = True
+                break
             if max_packets is not None and packet_count >= max_packets:
                 stopped_by_limit = True
                 break
@@ -302,6 +309,7 @@ def iter_microphone_packets(
             packet_count += 1
             yield packet
     finally:
+        stop_was_requested = stopped_by_event or stop_event.is_set()
         stop_event.set()
         if process.poll() is None:
             process.terminate()
@@ -315,7 +323,7 @@ def iter_microphone_packets(
         stderr_thread.join(timeout=1)
 
     return_code = process.poll()
-    if return_code and not stopped_by_limit:
+    if return_code and not stopped_by_limit and not stop_was_requested:
         detail = "\n".join(stderr_lines[-5:]).strip()
         raise RuntimeError(
             f"ffmpeg microphone capture failed with code {return_code}: {detail}"
@@ -599,6 +607,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--qwen-model", default=str(DEFAULT_QWEN_MODEL))
     parser.add_argument("--qwen-device", default=os.getenv("QWEN_DEVICE", "CPU"))
     parser.add_argument("--qwen-tokens", type=int, default=900)
+    parser.add_argument(
+        "--max-qwen-segments-per-update",
+        type=int,
+        default=int(os.getenv("QWEN_MAX_SEGMENTS_PER_UPDATE", DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE)),
+    )
     parser.add_argument("--update-every-seconds", type=float, default=30.0)
     parser.add_argument("--subtitle-update-every-seconds", type=float, default=5.0)
     parser.add_argument("--min-update-segments", type=int, default=2)
@@ -702,10 +715,14 @@ def main(argv: list[str] | None = None) -> int:
             sessions_dir=Path(args.sessions_dir),
         )
         domain_terms = parse_domain_terms(args.domain_terms)
+        debug_logger = QwenDebugLogger(qwen_debug_log_path(output_path))
+        if debug_logger.enabled:
+            log(f"Qwen debug log: {debug_logger.path}")
         updater = PeriodicMarkdownUpdater(
             qwen_factory=lambda: QwenMarkdownPolisher(
                 model_path=Path(args.qwen_model),
                 device=args.qwen_device,
+                debug_logger=debug_logger,
             ),
             snapshot_segments=lambda: client.snapshot_segments(completed_only=True),
             output_path=output_path,
@@ -716,7 +733,9 @@ def main(argv: list[str] | None = None) -> int:
             update_every_seconds=max(0.0, args.update_every_seconds),
             min_update_segments=max(1, args.min_update_segments),
             subtitle_update_every_seconds=max(0.0, args.subtitle_update_every_seconds),
+            max_qwen_segments_per_update=max(1, args.max_qwen_segments_per_update),
             on_markdown_update=syncer.enqueue_notes_update,
+            debug_logger=debug_logger,
         )
         log(f"Markdown output: {output_path}")
         updater.start()
@@ -738,19 +757,29 @@ def main(argv: list[str] | None = None) -> int:
         log("Stopping microphone stream...")
         stop_event.set()
         segments = client.snapshot_segments(completed_only=True)
-    except Exception:
+    except Exception as exc:
+        log(f"Microphone stream stopped before clean finalization: {exc}")
         session_monitor.stop()
+        segments = client.snapshot_segments(completed_only=True)
         if updater is not None:
-            updater.stop()
+            try:
+                final_output_path = updater.stop_and_flush(segments)
+                if final_output_path:
+                    log(f"Final Markdown ready after microphone stop: {final_output_path}")
+            except Exception as flush_exc:  # noqa: BLE001
+                log(f"Final Markdown flush failed after microphone stop: {flush_exc}")
         preview_syncer.stop()
         syncer.stop()
         raise
 
     session_monitor.stop()
     if updater is not None:
-        final_output_path = updater.stop_and_flush(segments)
-        if final_output_path:
-            log(f"Final Markdown ready: {final_output_path}")
+        try:
+            final_output_path = updater.stop_and_flush(segments)
+            if final_output_path:
+                log(f"Final Markdown ready: {final_output_path}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"Final Markdown flush failed: {exc}")
     preview_syncer.stop()
     syncer.stop()
     if syncer.enabled:

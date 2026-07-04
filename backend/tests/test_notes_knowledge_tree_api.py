@@ -159,6 +159,12 @@ class NotesKnowledgeTreeApiTest(unittest.IsolatedAsyncioTestCase):
         metadata = agent_api.local_storage.read_metadata(self.session_id)
         self.assertEqual(metadata["title"], "傅里叶变换与频域分析")
         self.assertEqual(metadata["course"], "信号与系统")
+        detail = agent_api.local_storage.read_session(self.session_id)
+        self.assertIn("傅里叶变换包含频域分析", detail.structured_notes_markdown or "")
+        self.assertEqual(
+            {node.label for node in detail.knowledge_graph.nodes},
+            {"傅里叶变换", "频域"},
+        )
 
     async def test_ended_session_rejects_non_final_notes_update(self) -> None:
         session_manager.end_session(self.session_id)

@@ -6,6 +6,7 @@ import type {
   ImageCapture,
   KnowledgeEdge,
   KnowledgeGraphView,
+  KnowledgeGraphStatus,
   KnowledgeNode,
   LectureSession,
   PostClassStatus,
@@ -37,6 +38,7 @@ export const initialDashboardState: ClassroomDashboardState = {
     edges: [],
     version: 0,
   },
+  knowledgeGraphStatus: "live",
   postClassStatus: "idle",
   postClassArtifacts: {
     summary_markdown: null,
@@ -107,6 +109,7 @@ export function classroomReducer(
         ...state,
         session: action.session,
         websocketStatus: "disconnected",
+        knowledgeGraphStatus: "finalizing",
         postClassStatus: "generating",
       };
 
@@ -173,8 +176,12 @@ function applyHistoryDetail(detail: SessionHistoryDetail): ClassroomDashboardSta
       edges: detail.knowledge_graph.edges,
       version: detail.knowledge_graph.version,
     },
+    knowledgeGraphStatus: parseKnowledgeGraphStatus(
+      detail.knowledge_graph_status,
+      detail.post_class_status,
+    ),
     postClassArtifacts: detail.post_class_artifacts ?? emptyPostClassArtifacts(),
-    postClassStatus: "ready",
+    postClassStatus: parsePostClassStatus(detail.post_class_status),
   };
 }
 
@@ -234,10 +241,23 @@ function applyPostClassUpdatedMessage(
 ): ClassroomDashboardState {
   const status = parsePostClassStatus(message.data.status);
   const artifacts = parsePostClassArtifacts(message.data.post_class_artifacts);
+  const session = readObject(message.data.session);
 
   return {
     ...state,
+    session:
+      state.session && session && typeof session.session_id === "string"
+        ? {
+            ...state.session,
+            ...session,
+          }
+        : state.session,
     postClassStatus: status,
+    knowledgeGraphStatus: parseKnowledgeGraphStatus(
+      message.data.knowledge_graph_status,
+      status,
+      state.knowledgeGraphStatus,
+    ),
     postClassArtifacts: artifacts ?? state.postClassArtifacts,
   };
 }
@@ -246,6 +266,28 @@ function parsePostClassStatus(value: unknown): PostClassStatus {
   return value === "ready" || value === "failed" || value === "generating"
     ? value
     : "ready";
+}
+
+function parseKnowledgeGraphStatus(
+  value: unknown,
+  postClassStatus?: unknown,
+  fallback: KnowledgeGraphStatus = "final",
+): KnowledgeGraphStatus {
+  if (
+    value === "live" ||
+    value === "finalizing" ||
+    value === "final" ||
+    value === "failed"
+  ) {
+    return value;
+  }
+  if (postClassStatus === "generating") {
+    return "finalizing";
+  }
+  if (postClassStatus === "failed") {
+    return "failed";
+  }
+  return fallback;
 }
 
 function parsePostClassArtifacts(value: unknown): SessionPostClassArtifacts | null {
@@ -334,6 +376,11 @@ function applySessionEndedMessage(
         }
       : state.session,
     websocketStatus: "disconnected",
+    knowledgeGraphStatus: parseKnowledgeGraphStatus(
+      readObject(message.data.storage)?.knowledge_graph_status,
+      readObject(message.data.storage)?.post_class_status,
+      "finalizing",
+    ),
   };
 }
 
@@ -538,9 +585,13 @@ function parseGraphPatchOperation(value: unknown): GraphPatchOperation | null {
   const operationType = data.op;
 
   if (
-    !["add_node", "update_node", "add_edge", "remove_node", "remove_edge"].includes(
-      operationType,
-    )
+    ![
+      "add_node",
+      "update_node",
+      "add_edge",
+      "remove_node",
+      "remove_edge",
+    ].includes(operationType)
   ) {
     return null;
   }

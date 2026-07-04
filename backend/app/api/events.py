@@ -59,6 +59,9 @@ from backend.app.models import (
 router = APIRouter(prefix="/events", tags=["events"])
 """事件路由实例，所有端点挂载在 ``/events`` 路径前缀下。"""
 
+_latest_transcript_previews: dict[str, TranscriptSegment] = {}
+"""Latest non-persistent ASR preview seen by the backend for each session."""
+
 
 @router.post("", response_model=EventAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
 async def receive_event(event: RealtimeEvent) -> EventAcceptedResponse:
@@ -116,6 +119,8 @@ async def receive_event(event: RealtimeEvent) -> EventAcceptedResponse:
         raise HTTPException(status_code=404, detail="Context not found")
     except ContextEventError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    _forget_preview_covered_by_event(event)
 
     # ContextManager 处理成功后，三类计数相加就是该课堂已接受的事件数。
     # 这样无需额外的 api/state.py 临时缓冲，也避免原始事件无限增长。
@@ -228,6 +233,7 @@ async def receive_transcript_preview(
         segment = TranscriptSegment.model_validate(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _latest_transcript_previews[request.session_id] = segment
 
     event_count = (
         len(context.transcript)
@@ -269,18 +275,47 @@ async def finalize_transcript_preview(
     endpoint promotes that preview to a normal ``transcript.segment`` so it is
     included in ``transcript.md`` and downstream notes/graph context.
     """
+    response = await _promote_transcript_preview_payload(
+        session_id=request.session_id,
+        payload=request.payload,
+    )
+    _latest_transcript_previews.pop(request.session_id, None)
+    return response
+
+
+async def promote_latest_transcript_preview(
+    session_id: str,
+) -> EventAcceptedResponse | None:
+    """Promote the newest backend-seen preview before ending the classroom."""
+    preview = _latest_transcript_previews.get(session_id)
+    if preview is None or not preview.text.strip():
+        return None
+    response = await _promote_transcript_preview_payload(
+        session_id=session_id,
+        payload=preview.model_dump(),
+    )
+    _latest_transcript_previews.pop(session_id, None)
+    return response
+
+
+async def _promote_transcript_preview_payload(
+    *,
+    session_id: str,
+    payload: dict[str, Any],
+) -> EventAcceptedResponse:
+    """Convert one preview payload into a normal final transcript event."""
     try:
-        session_manager.require_recording(request.session_id)
+        session_manager.require_recording(session_id)
     except SessionNotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
     except SessionConflictError:
         raise HTTPException(status_code=409, detail="Session is not recording")
 
     payload = {
-        **request.payload,
-        "session_id": request.session_id,
+        **payload,
+        "session_id": session_id,
         "is_final": True,
-        "source": request.payload.get("source") or "whisperlive_preview_finalized",
+        "source": payload.get("source") or "whisperlive_preview_finalized",
         "skip_realtime_extraction": True,
     }
     if not str(payload.get("segment_id") or "").strip():
@@ -289,11 +324,46 @@ async def finalize_transcript_preview(
         payload["segment_id"] = f"seg_preview_final_{start_ms}_{end_ms}"
 
     event = RealtimeEvent(
-        session_id=request.session_id,
+        session_id=session_id,
         event_type="transcript.segment",
         payload=payload,
     )
     return await receive_event(event)
+
+
+def _forget_preview_covered_by_event(event: RealtimeEvent) -> None:
+    """Drop stale previews once an overlapping final transcript arrives."""
+    if event.event_type != "transcript.segment":
+        return
+    preview = _latest_transcript_previews.get(event.session_id)
+    if preview is None:
+        return
+    try:
+        final_segment = TranscriptSegment.model_validate(
+            {**event.payload, "session_id": event.session_id}
+        )
+    except ValidationError:
+        return
+    if _preview_is_covered_by_final(preview, final_segment):
+        _latest_transcript_previews.pop(event.session_id, None)
+
+
+def _preview_is_covered_by_final(
+    preview: TranscriptSegment,
+    final_segment: TranscriptSegment,
+) -> bool:
+    """Return true when a final segment makes the latest preview obsolete."""
+    if preview.segment_id == final_segment.segment_id:
+        return True
+    if preview.text.strip() and preview.text.strip() == final_segment.text.strip():
+        return True
+    preview_midpoint = (preview.start_ts + preview.end_ts) / 2.0
+    if (
+        final_segment.start_ts - 0.25 <= preview_midpoint
+        and preview_midpoint <= final_segment.end_ts + 0.25
+    ):
+        return True
+    return False
 
 
 def _run_realtime_knowledge_extraction(event: RealtimeEvent) -> ExtractionResult | None:

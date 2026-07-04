@@ -478,10 +478,18 @@ def qwen_markdown_notes_prompt(
 ) -> str:
     """Prompt for local Qwen Markdown classroom notes generation."""
     transcript = "\n".join(
-        f"- [{_float(segment.get('start')):.2f}-{_float(segment.get('end')):.2f}] "
+        f"- id={segment.get('id') or ''}; "
+        f"[{_float(segment.get('start')):.2f}-{_float(segment.get('end')):.2f}] "
         f"{segment.get('text') or ''}"
         for segment in segments
     )
+    language = qwen_notes_prompt_language(segments)
+    if language == "en":
+        return _qwen_markdown_notes_prompt_en(
+            transcript=transcript,
+            domain_terms=domain_terms,
+        )
+
     terms = "、".join(domain_terms)
     return (
         "你是一个课堂笔记整理助手。"
@@ -495,6 +503,10 @@ def qwen_markdown_notes_prompt(
         "如果内容不足，就保持简短。\n"
         "整理目标：像认真听课的学生记笔记一样，优先保留课堂主线、知识点、定义、"
         "因果关系、老师强调的重点和可复习的条目；不要写成宣传文案或总结报告。\n"
+        "笔记必须是整理后的课堂笔记，不要机械复制字幕原句；可以把多个零散字幕"
+        "概括成一条有意义的知识点、定义、对比或因果关系。"
+        "例如不要把“有些用户是移动的/有些用户是固定的”分成碎片条目，"
+        "应整理为“系统需要处理移动、固定和高速宽带等异构用户场景”。\n"
         "不要输出逐句润色字幕，不要改写整段 WhisperLive 字幕；只在 summary、sections、"
         "keywords 这些笔记字段中做必要整理。\n"
         "可选课程关键词如下；如果未提供关键词，就只能依据字幕上下文做通用纠错："
@@ -509,15 +521,90 @@ def qwen_markdown_notes_prompt(
         "例如“苏晨克”可整理为“速成课”，“靠点/烤点”可整理为“考点”。\n"
         "- 候选修正会改变原意时，保持原字幕含义，不要猜测。\n"
         "这些保守修正规则只应用到 summary、sections、keywords。\n"
-        "每个 summary 条目和 section bullet 都必须能在原始字幕中找到直接依据。\n"
+        "每个 summary 条目和 section bullet 都必须能在原始字幕中找到直接依据，"
+        "并且必须填写 source_segment_ids。source_segment_ids 只能使用上方字幕里的 id，"
+        "表示这条笔记依据了哪些字幕片段；不要编造不存在的 id。\n"
+        "可以把多条字幕合并成一条自然课堂笔记，也可以做术语化整理；"
+        "但每个结论都必须能由 source_segment_ids 对应的字幕支持。\n"
         "只输出一个 JSON object，不要 Markdown，不要解释。\n"
         "JSON schema:\n"
         "{\n"
-        '  "summary": ["要点1", "要点2"],\n'
-        '  "sections": [{"heading": "小节标题", "bullets": ["条目"]}],\n'
+        '  "summary": [\n'
+        '    {"text": "要点1", "source_segment_ids": ["seg_whisperlive_..."]}\n'
+        "  ],\n"
+        '  "sections": [\n'
+        '    {"heading": "小节标题", "bullets": [\n'
+        '      {"text": "条目", "source_segment_ids": ["seg_whisperlive_..."]}\n'
+        "    ]}\n"
+        "  ],\n"
         '  "keywords": ["关键词"]\n'
         "}\n\n"
         "WhisperLive 字幕:\n"
+        f"{transcript}\n\n"
+        "JSON:"
+    )
+
+
+def _qwen_markdown_notes_prompt_en(
+    *,
+    transcript: str,
+    domain_terms: Sequence[str],
+) -> str:
+    """English prompt for English classroom notes.
+
+    Keeping the whole instruction in English is intentional: the local Qwen
+    model tended to answer Chinese when the instruction text was Chinese, even
+    when the lecture transcript was English.
+    """
+    terms = ", ".join(domain_terms)
+    return (
+        "You are a classroom note-taking assistant for live lecture transcripts.\n"
+        "TARGET_OUTPUT_LANGUAGE: English.\n"
+        "All values in summary, sections.heading, sections.bullets.text, and "
+        "keywords MUST be written in English. Do not translate the lecture into "
+        "Chinese. Do not output Chinese text unless the exact Chinese term appears "
+        "in the transcript or domain terms.\n"
+        "The system periodically sends WhisperLive transcript segments. Organize "
+        "them into structured classroom notes for a continuously updated Markdown "
+        "document.\n"
+        "Use only the provided transcript. Do not add facts, examples, definitions, "
+        "or background knowledge that are not supported by the transcript. Keep the "
+        "notes concise when the transcript is short.\n"
+        "Goal: write useful student notes that preserve the lecture thread, key "
+        "concepts, definitions, relationships, emphasized points, and reviewable "
+        "items. Do not polish line-by-line subtitles and do not rewrite the whole "
+        "transcript.\n"
+        "Prefer concise conceptual notes over transcript copies. Avoid bare "
+        "subtitle fragments such as \"Some users are mobile\" as standalone notes; "
+        "merge related fragments into a meaningful point, for example: \"Streaming "
+        "systems must handle heterogeneous users, including mobile, fixed, and "
+        "high-speed broadband users.\"\n"
+        "You may merge multiple transcript segments into one natural note and may "
+        "use standard terminology, but every note item must be supported by its "
+        "source_segment_ids.\n"
+        "Each summary item and each section bullet MUST include source_segment_ids. "
+        "source_segment_ids may only contain ids from the transcript below. Never "
+        "invent ids.\n"
+        "Optional domain terms: "
+        f"{terms or 'none'}.\n"
+        "Conservative correction rule: only fix obvious speech-recognition spelling "
+        "or terminology errors when the transcript context clearly supports the "
+        "correction. If a correction would change meaning, keep the transcript "
+        "meaning.\n"
+        "Return exactly one JSON object. Do not return Markdown. Do not explain.\n"
+        "JSON schema:\n"
+        "{\n"
+        '  "summary": [\n'
+        '    {"text": "Key point in English", "source_segment_ids": ["seg_whisperlive_..."]}\n'
+        "  ],\n"
+        '  "sections": [\n'
+        '    {"heading": "Section heading in English", "bullets": [\n'
+        '      {"text": "Bullet in English", "source_segment_ids": ["seg_whisperlive_..."]}\n'
+        "    ]}\n"
+        "  ],\n"
+        '  "keywords": ["English keyword"]\n'
+        "}\n\n"
+        "WhisperLive transcript segments:\n"
         f"{transcript}\n\n"
         "JSON:"
     )
@@ -528,10 +615,66 @@ def qwen_markdown_notes_repair_prompt(raw_text: str) -> str:
     return (
         "下面文本本应是课堂笔记 JSON，但格式不合法。"
         "请只输出合法 JSON object，不要解释，不要 Markdown。"
-        "必须包含 summary、sections、keywords 字段。\n\n"
+        "必须包含 summary、sections、keywords 字段。"
+        "summary 条目和 sections.bullets 条目应使用 {text, source_segment_ids} 结构；"
+        "如果原文没有 source_segment_ids，保持空数组。\n\n"
         f"原始文本:\n{raw_text}\n\n"
         "合法 JSON:"
     )
+
+
+def qwen_markdown_notes_quality_retry_prompt(
+    *,
+    segments: Sequence[Mapping[str, object]],
+    domain_terms: Sequence[str],
+    previous_output: str,
+    reason: str,
+) -> str:
+    """Retry prompt when Qwen returned JSON but not useful structured notes."""
+    base_prompt = qwen_markdown_notes_prompt(
+        segments=segments,
+        domain_terms=domain_terms,
+    )
+    if qwen_notes_prompt_language(segments) == "en":
+        return (
+            base_prompt
+            + "\n\n"
+            "The previous output may have been JSON, but it did not satisfy the "
+            "structured classroom notes requirements.\n"
+            f"Failure reason: {reason}\n"
+            "Regenerate the notes. summary must contain at least 2 English items; "
+            "sections must contain at least 1 English section with at least 2 "
+            "English bullets when the transcript has enough content. keywords may "
+            "be present but cannot be the only content.\n"
+            "Every summary item and bullet must include source_segment_ids from "
+            "the transcript input. Use only transcript-supported facts. Do not "
+            "invent. Do not output Chinese. Do not copy raw subtitle fragments; "
+            "merge related fragments into useful student notes.\n\n"
+            f"Previous output:\n{previous_output}\n\n"
+            "Regenerated valid JSON:"
+        )
+    return (
+        base_prompt
+        + "\n\n"
+        "上一次输出虽然可能是 JSON，但不满足课堂结构化笔记质量要求。\n"
+        f"不合格原因：{reason}\n"
+        "必须重新生成：summary 至少 2 条；sections 至少 1 个小节，且每个小节"
+        "至少包含 2 条 bullet；keywords 可以保留但不能是唯一内容。\n"
+        "每条 summary/bullet 必须带 source_segment_ids，且 id 必须来自字幕输入。"
+        "仍然必须只依据字幕，不要编造。不要复制字幕碎片，应该合并成有复习价值的"
+        "课堂笔记条目。\n\n"
+        f"上一次输出:\n{previous_output}\n\n"
+        "重新输出合法 JSON:"
+    )
+
+
+def qwen_notes_prompt_language(segments: Sequence[Mapping[str, object]]) -> str:
+    """Infer the target note language from transcript text."""
+    text = "\n".join(str(segment.get("text") or "") for segment in segments)
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    latin = sum(1 for char in text if char.isascii() and char.isalpha())
+    return "en" if latin > 0 and cjk == 0 else "zh"
+
 
 
 def _float(value: object) -> float:

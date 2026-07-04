@@ -951,6 +951,16 @@ button:disabled {
   background: #dfe8f4;
 }
 
+.visual-detail-actions .visual-fullscreen-button {
+  background: #172033;
+  color: #ffffff;
+  min-width: 64px;
+}
+
+.visual-detail-actions .visual-fullscreen-button:hover {
+  background: #0f172a;
+}
+
 .visual-analysis-status {
   background: #edf6ff;
   border: 1px solid #b9d7ff;
@@ -1028,13 +1038,22 @@ button:disabled {
 }
 
 .graph-view-toggle {
+  align-self: start;
+  grid-auto-rows: 34px;
   grid-template-columns: repeat(2, 88px);
+  height: 42px;
   justify-self: start;
+  max-height: 42px;
+  min-width: 184px;
+  overflow: hidden;
   width: 184px;
 }
 
 .graph-view-toggle button {
+  height: 34px;
+  min-height: 34px;
   min-width: 0;
+  padding: 0;
   width: 100%;
 }
 
@@ -1324,6 +1343,86 @@ button:disabled {
   line-height: 1.7;
   margin: 0;
   white-space: pre-wrap;
+}
+
+.post-class-summary-markdown {
+  display: grid;
+  gap: 8px;
+  line-height: 1.62;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.post-class-summary-markdown > :first-child {
+  margin-top: 0;
+}
+
+.post-class-summary-markdown h3,
+.post-class-summary-markdown h4,
+.post-class-summary-markdown h5 {
+  color: #172033;
+  font-size: 15px;
+  line-height: 1.35;
+  margin: 6px 0 0;
+}
+
+.post-class-summary-markdown h4 {
+  font-size: 14px;
+}
+
+.post-class-summary-markdown h5 {
+  color: #35445a;
+  font-size: 13px;
+}
+
+.post-class-summary-markdown p {
+  margin: 0;
+  white-space: normal;
+}
+
+.post-class-summary-markdown ul,
+.post-class-summary-markdown ol {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 22px;
+}
+
+.post-class-summary-markdown li {
+  margin: 0;
+}
+
+.post-class-summary-markdown blockquote {
+  background: #f4f8fd;
+  border-left: 3px solid #c6defc;
+  color: #3b4758;
+  margin: 0;
+  padding: 8px 10px;
+}
+
+.post-class-summary-markdown pre {
+  background: #172033;
+  border-radius: 6px;
+  color: #f8fafc;
+  margin: 0;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
+.post-class-summary-markdown code {
+  background: #edf2f7;
+  border-radius: 4px;
+  color: #172033;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+}
+
+.post-class-summary-markdown pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
 }
 
 .post-class-list {

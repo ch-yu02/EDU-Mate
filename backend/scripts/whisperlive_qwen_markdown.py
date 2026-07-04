@@ -29,8 +29,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -68,6 +69,8 @@ DEFAULT_SESSIONS_DIR = Path("data/sessions")
 DEFAULT_MARKDOWN_TITLE = "WhisperLive 本地课堂笔记"
 ENGLISH_MARKDOWN_TITLE = "WhisperLive Local Classroom Notes"
 DEFAULT_WHISPER_LANGUAGE = "auto"
+QWEN_DEBUG_LOG_FILENAME = "qwen_notes_debug.jsonl"
+DEFAULT_QWEN_DEBUG_LOG_MAX_CHARS = 20000
 ASR_HALLUCINATION_PHRASES = (
     "谢谢观看",
     "感谢观看",
@@ -82,6 +85,7 @@ ASR_HALLUCINATION_PHRASES = (
 ASR_MERGE_MAX_GAP_SECONDS = 0.9
 ASR_MERGE_MAX_DURATION_SECONDS = 12.0
 ASR_MERGE_MAX_WORDS = 45
+DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE = 8
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,8 @@ class MarkdownResult:
     summary: list[str]
     sections: list[tuple[str, list[str]]]
     keywords: list[str]
+    summary_source_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    bullet_source_ids: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,159 @@ class BackendSyncTask:
 def log(message: str) -> None:
     """Print one timestamped log line."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def env_flag(name: str, default: str = "1") -> bool:
+    """Return a boolean-like environment flag."""
+    value = os.getenv(name, default).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def int_env(name: str, default: int) -> int:
+    """Return an integer environment value."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+class QwenDebugLogger:
+    """Session-scoped JSONL logger for local Qwen note generation diagnostics."""
+
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        enabled: bool | None = None,
+        max_text_chars: int | None = None,
+    ) -> None:
+        self.path = path if (env_flag("QWEN_NOTES_DEBUG_LOG") if enabled is None else enabled) else None
+        self.max_text_chars = max(
+            1000,
+            max_text_chars
+            if max_text_chars is not None
+            else int_env("QWEN_NOTES_DEBUG_LOG_MAX_CHARS", DEFAULT_QWEN_DEBUG_LOG_MAX_CHARS),
+        )
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether this logger writes records."""
+        return self.path is not None
+
+    def event(self, event: str, **fields: Any) -> None:
+        """Append one JSONL diagnostic event."""
+        if self.path is None:
+            return
+        payload = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+            **{key: self._safe(value) for key, value in fields.items()},
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            with self._lock:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not break ASR.
+            log(f"Qwen debug log write failed: {exc}")
+
+    def _safe(self, value: Any) -> Any:
+        """Convert arbitrary values into JSON-safe, size-limited data."""
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, str):
+            if len(value) <= self.max_text_chars:
+                return value
+            return (
+                value[: self.max_text_chars]
+                + f"...<truncated {len(value) - self.max_text_chars} chars>"
+            )
+        if isinstance(value, dict):
+            return {str(key): self._safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._safe(item) for item in value]
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        return self._safe(str(value))
+
+
+def qwen_debug_log_path(output_path: Path) -> Path:
+    """Return the JSONL debug log path beside the structured notes file."""
+    return output_path.parent / QWEN_DEBUG_LOG_FILENAME
+
+
+def qwen_debug_segments(segments: list[WhisperLiveSegment]) -> list[dict[str, Any]]:
+    """Serialize transcript segments for Qwen diagnostics."""
+    return [
+        {
+            "segment_id": whisperlive_segment_id(segment),
+            "start": segment.start,
+            "end": segment.end,
+            "completed": segment.completed,
+            "text": segment.text,
+        }
+        for segment in segments
+    ]
+
+
+def qwen_debug_result(result: MarkdownResult) -> dict[str, Any]:
+    """Serialize a MarkdownResult for diagnostics."""
+    return {
+        "counts": markdown_result_counts(result),
+        "summary": result.summary,
+        "sections": [
+            {"heading": heading, "bullets": bullets}
+            for heading, bullets in result.sections
+        ],
+        "keywords": result.keywords,
+        "summary_source_ids": result.summary_source_ids,
+        "bullet_source_ids": {
+            f"{heading_key}|{bullet_key}": source_ids
+            for (heading_key, bullet_key), source_ids in result.bullet_source_ids.items()
+        },
+    }
+
+
+def qwen_debug_dropped_items(
+    raw: MarkdownResult,
+    grounded: MarkdownResult,
+) -> dict[str, Any]:
+    """Return note items dropped by grounding."""
+    grounded_summary = {markdown_merge_key(item) for item in grounded.summary}
+    raw_bullets = [
+        {"heading": heading, "bullet": bullet}
+        for heading, bullets in raw.sections
+        for bullet in bullets
+    ]
+    grounded_bullets = {
+        (markdown_merge_key(heading), markdown_merge_key(bullet))
+        for heading, bullets in grounded.sections
+        for bullet in bullets
+    }
+    return {
+        "summary": [
+            item
+            for item in raw.summary
+            if markdown_merge_key(item) not in grounded_summary
+        ],
+        "bullets": [
+            item
+            for item in raw_bullets
+            if (
+                markdown_merge_key(str(item["heading"])),
+                markdown_merge_key(str(item["bullet"])),
+            )
+            not in grounded_bullets
+        ],
+        "keywords": [
+            item
+            for item in raw.keywords
+            if markdown_merge_key(item)
+            not in {markdown_merge_key(keyword) for keyword in grounded.keywords}
+        ],
+    }
 
 
 def markdown_result_counts(result: MarkdownResult) -> dict[str, int]:
@@ -143,6 +302,11 @@ def whisperlive_segment_id(segment: WhisperLiveSegment) -> str:
         f"{segment.start:.3f}|{segment.end:.3f}|{segment.text}".encode("utf-8")
     ).hexdigest()[:8]
     return f"seg_whisperlive_{start}_{end}_{digest}"
+
+
+def qwen_segment_fingerprint(segment: WhisperLiveSegment) -> tuple[float, float, str]:
+    """Create the stable in-memory fingerprint used by Qwen batching."""
+    return (round(segment.start, 2), round(segment.end, 2), segment.text)
 
 
 def transcript_payload(segment: WhisperLiveSegment) -> dict[str, Any]:
@@ -939,11 +1103,42 @@ def coalesce_completed_asr_segments(
 class QwenMarkdownPolisher:
     """Local OpenVINO Qwen markdown generator."""
 
-    def __init__(self, *, model_path: Path, device: str) -> None:
+    def __init__(
+        self,
+        *,
+        model_path: Path,
+        device: str,
+        debug_logger: QwenDebugLogger | None = None,
+    ) -> None:
         import openvino_genai as ov_genai  # noqa: PLC0415
 
+        self.debug_logger = debug_logger
+        self._generation_count = 0
         log(f"Loading Qwen markdown model: {model_path} on {device}")
-        self.pipe = ov_genai.LLMPipeline(str(model_path), device)
+        started_at = time.monotonic()
+        self._debug(
+            "model_load_start",
+            model_path=str(model_path),
+            device=device,
+        )
+        try:
+            self.pipe = ov_genai.LLMPipeline(str(model_path), device)
+        except Exception as exc:  # noqa: BLE001
+            self._debug(
+                "model_load_error",
+                model_path=str(model_path),
+                device=device,
+                elapsed_seconds=time.monotonic() - started_at,
+                error=str(exc),
+                traceback=traceback.format_exc(),
+            )
+            raise
+        self._debug(
+            "model_load_done",
+            model_path=str(model_path),
+            device=device,
+            elapsed_seconds=time.monotonic() - started_at,
+        )
 
     def generate(
         self,
@@ -953,25 +1148,228 @@ class QwenMarkdownPolisher:
         domain_terms: list[str],
     ) -> MarkdownResult:
         """Generate structured Markdown data from transcript segments."""
+        generation_count = getattr(self, "_generation_count", 0) + 1
+        self._generation_count = generation_count
+        call_id = f"qwen_notes_{generation_count:06d}_{uuid.uuid4().hex[:8]}"
         prompt = build_markdown_prompt(segments, domain_terms=domain_terms)
-        raw = result_text(
-            self.pipe.generate(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+        self._debug(
+            "generate_start",
+            call_id=call_id,
+            max_new_tokens=max_new_tokens,
+            domain_terms=domain_terms,
+            prompt_language=prompt_templates.qwen_notes_prompt_language(
+                [
+                    {
+                        "text": segment.text,
+                    }
+                    for segment in segments
+                ]
+            ),
+            segment_count=len(segments),
+            segments=qwen_debug_segments(segments),
+            prompt_chars=len(prompt),
+            prompt=prompt,
         )
         try:
-            payload = parse_json_object(raw)
-        except ValueError:
+            raw, payload = self._generate_parseable_payload(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                call_id=call_id,
+                attempt="initial",
+            )
+            grounded = self._normalize_grounded_result(
+                payload,
+                segments,
+                domain_terms,
+                call_id=call_id,
+                attempt="initial",
+            )
+            if has_structured_markdown_content(grounded):
+                self._debug(
+                    "generate_success",
+                    call_id=call_id,
+                    attempt="initial",
+                    result=qwen_debug_result(grounded),
+                )
+                return grounded
+
+            reason = "Qwen output did not contain usable summary or sections after grounding"
+            log(
+                "Qwen markdown quality check failed; retrying with stricter prompt: "
+                f"{reason}; counts={format_markdown_result_counts(grounded)}"
+            )
+            retry_prompt = build_markdown_quality_retry_prompt(
+                segments,
+                domain_terms=domain_terms,
+                previous_output=raw,
+                reason=reason,
+            )
+            self._debug(
+                "quality_retry_start",
+                call_id=call_id,
+                reason=reason,
+                previous_counts=markdown_result_counts(grounded),
+                retry_prompt_chars=len(retry_prompt),
+                retry_prompt=retry_prompt,
+            )
+            retry_raw, retry_payload = self._generate_parseable_payload(
+                retry_prompt,
+                max_new_tokens=max_new_tokens,
+                call_id=call_id,
+                attempt="quality_retry",
+            )
+            retry_grounded = self._normalize_grounded_result(
+                retry_payload,
+                segments,
+                domain_terms,
+                call_id=call_id,
+                attempt="quality_retry",
+            )
+            if not has_structured_markdown_content(retry_grounded):
+                self._debug(
+                    "quality_retry_failed",
+                    call_id=call_id,
+                    result=qwen_debug_result(retry_grounded),
+                )
+                raise RuntimeError(
+                    "Qwen markdown quality check failed after retry: "
+                    f"{format_markdown_result_counts(retry_grounded)}"
+                )
+            self._debug(
+                "generate_success",
+                call_id=call_id,
+                attempt="quality_retry",
+                result=qwen_debug_result(retry_grounded),
+            )
+            return retry_grounded
+        except Exception as exc:  # noqa: BLE001
+            self._debug(
+                "generate_error",
+                call_id=call_id,
+                error=str(exc),
+                traceback=traceback.format_exc(),
+            )
+            raise
+
+    def _generate_parseable_payload(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int,
+        call_id: str,
+        attempt: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Generate a JSON payload, retrying once when Qwen output is truncated."""
+        self._debug(
+            "pipe_generate_start",
+            call_id=call_id,
+            attempt=attempt,
+            max_new_tokens=max_new_tokens,
+            prompt_chars=len(prompt),
+        )
+        started_at = time.monotonic()
+        try:
             raw = result_text(
+                self.pipe.generate(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._debug(
+                "pipe_generate_error",
+                call_id=call_id,
+                attempt=attempt,
+                elapsed_seconds=time.monotonic() - started_at,
+                error=str(exc),
+                traceback=traceback.format_exc(),
+            )
+            raise
+        self._debug(
+            "pipe_generate_done",
+            call_id=call_id,
+            attempt=attempt,
+            elapsed_seconds=time.monotonic() - started_at,
+            raw_chars=len(raw),
+            raw_output=raw,
+        )
+        try:
+            payload = parse_qwen_markdown_payload(
+                raw,
+                max_new_tokens=max_new_tokens,
+                pipe=self.pipe,
+                debug_logger=self._debug_logger(),
+                call_id=call_id,
+                attempt=attempt,
+            )
+            self._debug(
+                "parse_success",
+                call_id=call_id,
+                attempt=attempt,
+                payload=payload,
+            )
+            return raw, payload
+        except RuntimeError as exc:
+            self._debug(
+                "parse_error",
+                call_id=call_id,
+                attempt=attempt,
+                error=str(exc),
+            )
+            if not is_truncated_qwen_json_error(exc):
+                raise
+            retry_tokens = expanded_qwen_json_token_budget(max_new_tokens)
+            if retry_tokens <= max_new_tokens:
+                raise
+            log(
+                "Qwen markdown JSON looked truncated; retrying generation "
+                f"with max_new_tokens={retry_tokens}"
+            )
+            self._debug(
+                "truncated_json_retry_start",
+                call_id=call_id,
+                attempt=attempt,
+                retry_tokens=retry_tokens,
+            )
+            retry_started_at = time.monotonic()
+            retry_raw = result_text(
                 self.pipe.generate(
-                    build_markdown_repair_prompt(raw),
-                    max_new_tokens=max_new_tokens,
+                    prompt,
+                    max_new_tokens=retry_tokens,
                     do_sample=False,
                 )
             )
-            try:
-                payload = parse_json_object(raw)
-            except ValueError as exc:
-                log(f"Qwen markdown JSON parse failed after repair: {exc}; using fallback")
-                return fallback_markdown_result(segments)
+            self._debug(
+                "truncated_json_retry_done",
+                call_id=call_id,
+                attempt=attempt,
+                elapsed_seconds=time.monotonic() - retry_started_at,
+                raw_chars=len(retry_raw),
+                raw_output=retry_raw,
+            )
+            retry_payload = parse_qwen_markdown_payload(
+                retry_raw,
+                max_new_tokens=retry_tokens,
+                pipe=self.pipe,
+                debug_logger=self._debug_logger(),
+                call_id=call_id,
+                attempt=f"{attempt}_truncated_retry",
+            )
+            self._debug(
+                "parse_success",
+                call_id=call_id,
+                attempt=f"{attempt}_truncated_retry",
+                payload=retry_payload,
+            )
+            return retry_raw, retry_payload
+
+    def _normalize_grounded_result(
+        self,
+        payload: dict[str, Any],
+        segments: list[WhisperLiveSegment],
+        domain_terms: list[str],
+        *,
+        call_id: str,
+        attempt: str,
+    ) -> MarkdownResult:
+        """Normalize one Qwen payload and enforce transcript grounding."""
         result = normalize_markdown_result(payload, segments)
         log(f"Qwen markdown raw counts: {format_markdown_result_counts(result)}")
         grounded = enforce_markdown_grounding(
@@ -980,7 +1378,443 @@ class QwenMarkdownPolisher:
             domain_terms=domain_terms,
         )
         log(f"Qwen markdown grounded counts: {format_markdown_result_counts(grounded)}")
+        self._debug(
+            "grounding_result",
+            call_id=call_id,
+            attempt=attempt,
+            raw_result=qwen_debug_result(result),
+            grounded_result=qwen_debug_result(grounded),
+            dropped=qwen_debug_dropped_items(result, grounded),
+        )
         return grounded
+
+    def _debug_logger(self) -> QwenDebugLogger | None:
+        """Return the optional debug logger for object.__new__ test instances."""
+        return getattr(self, "debug_logger", None)
+
+    def _debug(self, event: str, **fields: Any) -> None:
+        """Write a Qwen debug event if a logger is attached."""
+        logger = self._debug_logger()
+        if logger is not None:
+            logger.event(event, **fields)
+
+
+def parse_qwen_markdown_payload(
+    raw: str,
+    *,
+    max_new_tokens: int,
+    pipe: Any,
+    debug_logger: QwenDebugLogger | None = None,
+    call_id: str = "",
+    attempt: str = "",
+) -> dict[str, Any]:
+    """Parse Qwen notes JSON, using Qwen once more only for malformed JSON repair."""
+    try:
+        return parse_json_object(raw)
+    except ValueError as first_error:
+        if debug_logger is not None:
+            debug_logger.event(
+                "json_parse_failed",
+                call_id=call_id,
+                attempt=attempt,
+                error=str(first_error),
+                raw_chars=len(raw),
+                raw_output=raw,
+            )
+        repair_tokens = expanded_qwen_json_token_budget(max_new_tokens)
+        repair_prompt = build_markdown_repair_prompt(raw)
+        if debug_logger is not None:
+            debug_logger.event(
+                "json_repair_start",
+                call_id=call_id,
+                attempt=attempt,
+                repair_tokens=repair_tokens,
+                repair_prompt_chars=len(repair_prompt),
+                repair_prompt=repair_prompt,
+            )
+        repair_started_at = time.monotonic()
+        repaired = result_text(
+            pipe.generate(
+                repair_prompt,
+                max_new_tokens=repair_tokens,
+                do_sample=False,
+            )
+        )
+        if debug_logger is not None:
+            debug_logger.event(
+                "json_repair_done",
+                call_id=call_id,
+                attempt=attempt,
+                elapsed_seconds=time.monotonic() - repair_started_at,
+                repaired_chars=len(repaired),
+                repaired_output=repaired,
+            )
+        try:
+            payload = parse_json_object(repaired)
+        except ValueError as exc:
+            if debug_logger is not None:
+                debug_logger.event(
+                    "json_repair_parse_failed",
+                    call_id=call_id,
+                    attempt=attempt,
+                    error=str(exc),
+                    repaired_output=repaired,
+                )
+            raise RuntimeError(f"Qwen markdown JSON parse failed after repair: {exc}") from exc
+        if debug_logger is not None:
+            debug_logger.event(
+                "json_repair_parse_success",
+                call_id=call_id,
+                attempt=attempt,
+                payload=payload,
+            )
+        return payload
+
+
+def expanded_qwen_json_token_budget(max_new_tokens: int) -> int:
+    """Give malformed/truncated JSON repair enough room to close the object."""
+    if max_new_tokens >= 4096:
+        return max_new_tokens
+    return min(4096, max(max_new_tokens + 512, max_new_tokens * 2))
+
+
+def is_truncated_qwen_json_error(exc: BaseException) -> bool:
+    """Return true for parse failures that look like incomplete JSON output."""
+    text = str(exc).lower()
+    return "unbalanced json object" in text or "unterminated" in text
+
+
+def has_structured_markdown_content(result: MarkdownResult) -> bool:
+    """Return true only when Qwen produced actual note content, not just keywords."""
+    return bool(result.summary or result.sections)
+
+
+def markdown_item_sources(
+    source_map: dict[str, tuple[str, ...]],
+    text: str,
+) -> tuple[str, ...]:
+    """Return source ids for one note item by its normalized text key."""
+    return source_map.get(markdown_merge_key(text), ())
+
+
+def markdown_bullet_sources(
+    source_map: dict[tuple[str, str], tuple[str, ...]],
+    heading: str,
+    bullet: str,
+) -> tuple[str, ...]:
+    """Return source ids for one section bullet."""
+    return source_map.get((markdown_merge_key(heading), markdown_merge_key(bullet)), ())
+
+
+def merge_markdown_results(
+    previous: MarkdownResult | None,
+    update: MarkdownResult,
+    *,
+    max_summary_items: int = 12,
+    max_keywords: int = 24,
+    max_bullets_per_section: int = 8,
+) -> MarkdownResult:
+    """Merge a small Qwen note update into the accumulated classroom notes."""
+    if previous is None:
+        return update
+
+    summary = merge_note_items(
+        previous.summary,
+        update.summary,
+        source_maps=[previous.summary_source_ids, update.summary_source_ids],
+        limit=max_summary_items,
+    )
+    keywords = merge_text_items(
+        previous.keywords,
+        update.keywords,
+        limit=max_keywords,
+    )
+
+    summary_source_ids = build_merged_source_map(
+        summary,
+        [previous.summary_source_ids, update.summary_source_ids],
+    )
+
+    sections: list[tuple[str, list[str]]] = []
+    bullet_source_ids: dict[tuple[str, str], tuple[str, ...]] = {}
+    section_index: dict[str, int] = {}
+    for result, (heading, bullets) in [
+        *((previous, section) for section in previous.sections),
+        *((update, section) for section in update.sections),
+    ]:
+        clean_heading = heading.strip() or "课堂重点"
+        key = markdown_merge_key(clean_heading)
+        if key in section_index:
+            index = section_index[key]
+            existing_heading, existing_bullets = sections[index]
+            merged_bullets = merge_note_items(
+                existing_bullets,
+                bullets,
+                source_maps=[bullet_source_ids_for_heading(bullet_source_ids, existing_heading), result.bullet_source_ids],
+                heading=clean_heading,
+                limit=max_bullets_per_section,
+            )
+            sections[index] = (
+                existing_heading,
+                merged_bullets,
+            )
+            bullet_source_ids.update(
+                build_merged_bullet_source_map(
+                    clean_heading,
+                    merged_bullets,
+                    [
+                        bullet_source_ids_for_heading(
+                            bullet_source_ids,
+                            existing_heading,
+                        ),
+                        result.bullet_source_ids,
+                    ],
+                )
+            )
+            continue
+        section_index[key] = len(sections)
+        merged_bullets = merge_note_items(
+            [],
+            bullets,
+            source_maps=[result.bullet_source_ids],
+            heading=clean_heading,
+            limit=max_bullets_per_section,
+        )
+        sections.append(
+            (
+                clean_heading,
+                merged_bullets,
+            )
+        )
+        bullet_source_ids.update(
+            build_merged_bullet_source_map(
+                clean_heading,
+                merged_bullets,
+                [result.bullet_source_ids],
+            )
+        )
+
+    return MarkdownResult(
+        summary=summary,
+        sections=[(heading, bullets) for heading, bullets in sections if bullets],
+        keywords=keywords,
+        summary_source_ids=summary_source_ids,
+        bullet_source_ids=bullet_source_ids,
+    )
+
+
+def merge_text_items(
+    existing: list[str],
+    incoming: list[str],
+    *,
+    limit: int,
+) -> list[str]:
+    """Merge text lists by normalized content while preserving order."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in [*existing, *incoming]:
+        text = item.strip()
+        if not text:
+            continue
+        key = markdown_merge_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def merge_note_items(
+    existing: list[str],
+    incoming: list[str],
+    *,
+    source_maps: list[dict[Any, tuple[str, ...]]],
+    limit: int,
+    heading: str | None = None,
+) -> list[str]:
+    """Merge note text while preserving source ids in later helper maps."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in [*existing, *incoming]:
+        text = item.strip()
+        if not text:
+            continue
+        key = markdown_merge_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(text)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def source_ids_for_note_key(
+    text: str,
+    source_maps: list[dict[str, tuple[str, ...]]],
+) -> tuple[str, ...]:
+    """Merge source ids for a summary item from multiple normalized maps."""
+    key = markdown_merge_key(text)
+    return merge_source_id_tuples([source_map.get(key, ()) for source_map in source_maps])
+
+
+def source_ids_for_bullet_key(
+    heading: str,
+    bullet: str,
+    source_maps: list[dict[Any, tuple[str, ...]]],
+) -> tuple[str, ...]:
+    """Merge source ids for one section bullet from multiple map shapes."""
+    bullet_key = markdown_merge_key(bullet)
+    heading_key = markdown_merge_key(heading)
+    candidates: list[tuple[str, ...]] = []
+    for source_map in source_maps:
+        candidates.append(source_map.get((heading_key, bullet_key), ()))  # type: ignore[arg-type]
+        candidates.append(source_map.get(bullet_key, ()))  # type: ignore[arg-type]
+    return merge_source_id_tuples(candidates)
+
+
+def merge_source_id_tuples(values: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
+    """Merge source id tuples preserving order and removing duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for source_id in value:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            merged.append(source_id)
+    return tuple(merged)
+
+
+def build_merged_source_map(
+    items: list[str],
+    source_maps: list[dict[str, tuple[str, ...]]],
+) -> dict[str, tuple[str, ...]]:
+    """Build a normalized summary source map for merged note items."""
+    return {
+        markdown_merge_key(item): source_ids_for_note_key(item, source_maps)
+        for item in items
+        if source_ids_for_note_key(item, source_maps)
+    }
+
+
+def build_merged_bullet_source_map(
+    heading: str,
+    bullets: list[str],
+    source_maps: list[dict[Any, tuple[str, ...]]],
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Build a normalized bullet source map for merged section bullets."""
+    return {
+        (markdown_merge_key(heading), markdown_merge_key(bullet)): source_ids
+        for bullet in bullets
+        if (
+            source_ids := source_ids_for_bullet_key(
+                heading,
+                bullet,
+                source_maps,
+            )
+        )
+    }
+
+
+def bullet_source_ids_for_heading(
+    source_map: dict[tuple[str, str], tuple[str, ...]],
+    heading: str,
+) -> dict[str, tuple[str, ...]]:
+    """Return a bullet-only source map for one heading."""
+    heading_key = markdown_merge_key(heading)
+    return {
+        bullet_key: source_ids
+        for (candidate_heading, bullet_key), source_ids in source_map.items()
+        if candidate_heading == heading_key
+    }
+
+
+def markdown_merge_key(text: str) -> str:
+    """Normalize one note item for lightweight deduplication."""
+    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE).lower()
+
+
+def generate_incremental_markdown_result(
+    qwen: QwenMarkdownPolisher,
+    segments: list[WhisperLiveSegment],
+    *,
+    max_new_tokens: int,
+    domain_terms: list[str],
+    max_qwen_segments_per_update: int,
+    debug_logger: QwenDebugLogger | None = None,
+) -> MarkdownResult:
+    """Generate notes in small batches and merge the Qwen results."""
+    result: MarkdownResult | None = None
+    batch_size = max(1, max_qwen_segments_per_update)
+    if debug_logger is not None:
+        debug_logger.event(
+            "final_incremental_generation_start",
+            segment_count=len(segments),
+            batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            domain_terms=domain_terms,
+            segments=qwen_debug_segments(segments),
+        )
+    for index in range(0, len(segments), batch_size):
+        batch = segments[index : index + batch_size]
+        if debug_logger is not None:
+            debug_logger.event(
+                "final_incremental_batch_start",
+                batch_index=index // batch_size + 1,
+                batch_size=len(batch),
+                segments=qwen_debug_segments(batch),
+            )
+        batch_result = qwen.generate(
+            batch,
+            max_new_tokens=max_new_tokens,
+            domain_terms=domain_terms,
+        )
+        result = merge_markdown_results(result, batch_result)
+        if debug_logger is not None:
+            debug_logger.event(
+                "final_incremental_batch_done",
+                batch_index=index // batch_size + 1,
+                batch_result=qwen_debug_result(batch_result),
+                merged_result=qwen_debug_result(result),
+            )
+    if not has_structured_markdown_content(result):
+        raise RuntimeError(
+            "Qwen markdown result has no summary or sections after incremental generation: "
+            f"{format_markdown_result_counts(result or MarkdownResult([], [], []))}"
+        )
+    if debug_logger is not None:
+        debug_logger.event(
+            "final_incremental_generation_done",
+            result=qwen_debug_result(result),
+        )
+    return result
+
+
+def build_markdown_quality_retry_prompt(
+    segments: list[WhisperLiveSegment],
+    *,
+    domain_terms: list[str],
+    previous_output: str,
+    reason: str,
+) -> str:
+    """Ask Qwen to regenerate when JSON was valid but note content was unusable."""
+    return prompt_templates.qwen_markdown_notes_quality_retry_prompt(
+        segments=[
+            {
+                "id": whisperlive_segment_id(segment),
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+            }
+            for segment in segments
+        ],
+        domain_terms=domain_terms,
+        previous_output=previous_output,
+        reason=reason,
+    )
 
 
 def build_markdown_prompt(
@@ -992,6 +1826,7 @@ def build_markdown_prompt(
     return prompt_templates.qwen_markdown_notes_prompt(
         segments=[
             {
+                "id": whisperlive_segment_id(segment),
                 "start": segment.start,
                 "end": segment.end,
                 "text": segment.text,
@@ -1012,31 +1847,96 @@ def normalize_markdown_result(
     segments: list[WhisperLiveSegment],
 ) -> MarkdownResult:
     """Normalize Qwen JSON into MarkdownResult."""
-    summary = clean_list(payload.get("summary"))
+    summary, summary_source_ids = clean_note_items(payload.get("summary"))
     keywords = clean_list(payload.get("keywords"))
 
     sections: list[tuple[str, list[str]]] = []
+    bullet_source_ids: dict[tuple[str, str], tuple[str, ...]] = {}
     raw_sections = payload.get("sections")
     if isinstance(raw_sections, list):
         for item in raw_sections:
             if not isinstance(item, dict):
                 continue
             heading = clean_scalar(item.get("heading"))
-            bullets = clean_list(item.get("bullets"))
+            bullets, bullet_sources = clean_note_items(item.get("bullets"))
             if heading and bullets:
                 sections.append((heading, bullets))
+                heading_key = markdown_merge_key(heading)
+                for bullet in bullets:
+                    source_ids = bullet_sources.get(markdown_merge_key(bullet), ())
+                    if source_ids:
+                        bullet_source_ids[(heading_key, markdown_merge_key(bullet))] = source_ids
 
     if not sections and summary:
         sections.append(("课堂要点", summary))
+        heading_key = markdown_merge_key("课堂要点")
+        for item in summary:
+            source_ids = summary_source_ids.get(markdown_merge_key(item), ())
+            if source_ids:
+                bullet_source_ids[(heading_key, markdown_merge_key(item))] = source_ids
     return MarkdownResult(
         summary=summary,
         sections=sections,
         keywords=keywords,
+        summary_source_ids=summary_source_ids,
+        bullet_source_ids=bullet_source_ids,
     )
 
 
+def clean_note_items(value: object) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    """Normalize note items that can be strings or source-backed objects."""
+    if not isinstance(value, list):
+        return [], {}
+    items: list[str] = []
+    sources: dict[str, tuple[str, ...]] = {}
+    seen: set[str] = set()
+    for raw_item in value:
+        text, source_ids = clean_note_item(raw_item)
+        if not text:
+            continue
+        key = markdown_merge_key(text)
+        if key in seen:
+            if source_ids:
+                sources[key] = merge_source_id_tuples([sources.get(key, ()), source_ids])
+            continue
+        seen.add(key)
+        items.append(text)
+        if source_ids:
+            sources[key] = source_ids
+    return items, sources
+
+
+def clean_note_item(value: object) -> tuple[str, tuple[str, ...]]:
+    """Return note text and declared transcript evidence ids."""
+    if isinstance(value, dict):
+        text = clean_scalar(
+            value.get("text")
+            or value.get("content")
+            or value.get("summary")
+            or value.get("bullet")
+        )
+        source_ids = clean_source_segment_ids(value.get("source_segment_ids"))
+        return text, source_ids
+    return clean_scalar(value), ()
+
+
+def clean_source_segment_ids(value: object) -> tuple[str, ...]:
+    """Normalize a source_segment_ids field."""
+    if not isinstance(value, list):
+        return ()
+    source_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        source_id = clean_scalar(item)
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        source_ids.append(source_id)
+    return tuple(source_ids)
+
+
 def fallback_markdown_result(segments: list[WhisperLiveSegment]) -> MarkdownResult:
-    """Build a minimal MarkdownResult when Qwen returns malformed JSON."""
+    """Build an empty MarkdownResult while Qwen notes are still pending."""
     return MarkdownResult(
         summary=[],
         sections=[],
@@ -1062,7 +1962,7 @@ def is_grounded_note_item(
     domain_terms: list[str],
     min_coverage: float = 0.72,
 ) -> bool:
-    """Return true when a note item is supported by the transcript."""
+    """Return true for legacy note items that do not include source ids."""
     item_key = transcript_compare_key(text)
     if not item_key or not transcript_key:
         return False
@@ -1085,6 +1985,162 @@ def is_grounded_note_item(
         sequence_coverage(item_key, transcript_key) >= min_coverage
         and unmatched <= max_unmatched
     )
+
+
+ENGLISH_STOP_WORDS = {
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "also",
+    "and",
+    "are",
+    "because",
+    "been",
+    "before",
+    "being",
+    "between",
+    "both",
+    "can",
+    "could",
+    "does",
+    "from",
+    "has",
+    "have",
+    "having",
+    "here",
+    "into",
+    "its",
+    "itself",
+    "more",
+    "most",
+    "not",
+    "now",
+    "onto",
+    "other",
+    "over",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "through",
+    "using",
+    "when",
+    "where",
+    "which",
+    "while",
+    "with",
+    "within",
+    "will",
+    "would",
+    "you",
+    "your",
+}
+
+
+def content_tokens(text: str) -> set[str]:
+    """Return content-bearing tokens for lightweight evidence checks."""
+    normalized = clean_scalar(text).lower()
+    tokens: set[str] = set()
+    for word in re.findall(r"[a-z0-9]+", normalized):
+        if len(word) < 3 or word in ENGLISH_STOP_WORDS:
+            continue
+        tokens.add(word)
+        if word.endswith("s") and len(word) > 4:
+            tokens.add(word[:-1])
+        if word.endswith("ing") and len(word) > 6:
+            tokens.add(word[:-3])
+        if word.endswith("ed") and len(word) > 5:
+            tokens.add(word[:-2])
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+        if len(chunk) == 2:
+            tokens.add(chunk)
+            continue
+        tokens.update(chunk[index : index + 2] for index in range(len(chunk) - 1))
+    return tokens
+
+
+def note_supported_by_evidence(
+    text: str,
+    *,
+    evidence_text: str,
+    all_transcript_key: str,
+    domain_terms: list[str],
+) -> bool:
+    """Return true when a source-backed note item is supported by cited text."""
+    item_key = transcript_compare_key(text)
+    evidence_key = transcript_compare_key(evidence_text)
+    if not item_key or not evidence_key:
+        return False
+    if item_key in evidence_key or item_key in all_transcript_key:
+        return True
+
+    note_tokens = content_tokens(text)
+    evidence_tokens = content_tokens(evidence_text)
+    if note_tokens:
+        shared = note_tokens & evidence_tokens
+        coverage = len(shared) / len(note_tokens)
+        required_shared = 1 if len(note_tokens) <= 2 else 2
+        if coverage >= 0.28 and len(shared) >= required_shared:
+            return True
+
+    domain_keys = [transcript_compare_key(term) for term in domain_terms]
+    for term_key in domain_keys:
+        if term_key and term_key in item_key and term_key in evidence_key:
+            return True
+
+    return sequence_coverage(item_key, evidence_key) >= 0.45
+
+
+def segment_map_by_id(segments: list[WhisperLiveSegment]) -> dict[str, WhisperLiveSegment]:
+    """Index transcript segments by the ids exposed to Qwen."""
+    return {whisperlive_segment_id(segment): segment for segment in segments}
+
+
+def filter_grounded_notes(
+    values: list[str],
+    *,
+    source_map: dict[str, tuple[str, ...]],
+    segment_by_id: dict[str, WhisperLiveSegment],
+    transcript_key: str,
+    domain_terms: list[str],
+) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    """Keep note items with valid transcript evidence."""
+    grounded_items: list[str] = []
+    grounded_sources: dict[str, tuple[str, ...]] = {}
+    for item in values:
+        key = markdown_merge_key(item)
+        source_ids = source_map.get(key, ())
+        if source_ids:
+            valid_ids = tuple(source_id for source_id in source_ids if source_id in segment_by_id)
+            if not valid_ids:
+                continue
+            evidence_text = " ".join(segment_by_id[source_id].text for source_id in valid_ids)
+            if not note_supported_by_evidence(
+                item,
+                evidence_text=evidence_text,
+                all_transcript_key=transcript_key,
+                domain_terms=domain_terms,
+            ):
+                continue
+            grounded_items.append(item)
+            grounded_sources[key] = valid_ids
+            continue
+
+        if is_grounded_note_item(
+            item,
+            transcript_key=transcript_key,
+            domain_terms=domain_terms,
+        ):
+            grounded_items.append(item)
+    return grounded_items, grounded_sources
 
 
 def filter_grounded_list(
@@ -1113,9 +2169,12 @@ def enforce_markdown_grounding(
 ) -> MarkdownResult:
     """Drop Qwen note content that is not supported by the transcript."""
     transcript_key = combined_transcript_key(segments)
+    segment_by_id = segment_map_by_id(segments)
 
-    summary = filter_grounded_list(
+    summary, summary_source_ids = filter_grounded_notes(
         result.summary,
+        source_map=result.summary_source_ids,
+        segment_by_id=segment_by_id,
         transcript_key=transcript_key,
         domain_terms=domain_terms,
     )
@@ -1126,14 +2185,27 @@ def enforce_markdown_grounding(
     )
 
     sections: list[tuple[str, list[str]]] = []
+    bullet_source_ids: dict[tuple[str, str], tuple[str, ...]] = {}
     for heading, bullets in result.sections:
-        grounded_bullets = filter_grounded_list(
+        heading_key = markdown_merge_key(heading)
+        bullet_sources = {
+            bullet_key: source_ids
+            for (candidate_heading, bullet_key), source_ids in result.bullet_source_ids.items()
+            if candidate_heading == heading_key
+        }
+        grounded_bullets, grounded_bullet_sources = filter_grounded_notes(
             bullets,
+            source_map=bullet_sources,
+            segment_by_id=segment_by_id,
             transcript_key=transcript_key,
             domain_terms=domain_terms,
         )
         if grounded_bullets:
             sections.append((heading, grounded_bullets))
+            for bullet in grounded_bullets:
+                source_ids = grounded_bullet_sources.get(markdown_merge_key(bullet), ())
+                if source_ids:
+                    bullet_source_ids[(heading_key, markdown_merge_key(bullet))] = source_ids
 
     if result.summary and not summary:
         log("Dropped ungrounded Qwen summary items")
@@ -1144,6 +2216,8 @@ def enforce_markdown_grounding(
         summary=summary,
         sections=sections,
         keywords=keywords,
+        summary_source_ids=summary_source_ids,
+        bullet_source_ids=bullet_source_ids,
     )
 
 
@@ -1297,6 +2371,7 @@ class PeriodicMarkdownUpdater:
         update_every_seconds: float,
         min_update_segments: int,
         subtitle_update_every_seconds: float = 0.0,
+        max_qwen_segments_per_update: int = DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE,
         on_markdown_update: Callable[
             [
                 str,
@@ -1309,6 +2384,7 @@ class PeriodicMarkdownUpdater:
             None,
         ]
         | None = None,
+        debug_logger: QwenDebugLogger | None = None,
     ) -> None:
         self.qwen_factory = qwen_factory
         self.snapshot_segments = snapshot_segments
@@ -1320,12 +2396,15 @@ class PeriodicMarkdownUpdater:
         self.update_every_seconds = update_every_seconds
         self.min_update_segments = min_update_segments
         self.subtitle_update_every_seconds = subtitle_update_every_seconds
+        self.max_qwen_segments_per_update = max(1, max_qwen_segments_per_update)
         self.on_markdown_update = on_markdown_update
+        self.debug_logger = debug_logger
         self._qwen: QwenMarkdownPolisher | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_fingerprint: tuple[tuple[float, float, str], ...] = ()
         self._last_subtitle_fingerprint: tuple[tuple[float, float, str], ...] = ()
+        self._failed_qwen_fingerprint: tuple[tuple[float, float, str], ...] = ()
         self._latest_qwen_result: MarkdownResult | None = None
         self.update_count = 0
 
@@ -1360,27 +2439,124 @@ class PeriodicMarkdownUpdater:
         final: bool,
     ) -> Path | None:
         """Regenerate the notes file from the provided segment snapshot."""
-        if not final and len(segments) < self.min_update_segments:
-            return None
         fingerprint = self._fingerprint(segments)
-        if not final and fingerprint == self._last_fingerprint:
+        pending_segments = self._pending_segments_for_update(segments, final=final)
+        self._debug(
+            "updater_write_update_start",
+            final=final,
+            total_segments=len(segments),
+            pending_segments=len(pending_segments),
+            latest_qwen_ready=self._latest_qwen_result is not None,
+            failed_retry_segments=len(self._failed_qwen_fingerprint),
+            segments=qwen_debug_segments(segments),
+            pending=qwen_debug_segments(pending_segments),
+        )
+        if not final and len(pending_segments) < self.min_update_segments:
+            self._debug(
+                "updater_write_update_skip",
+                final=final,
+                reason="not_enough_pending_segments",
+                pending_segments=len(pending_segments),
+                min_update_segments=self.min_update_segments,
+            )
             return None
-        recent_segments = self._recent_segments_for_update(segments)
-        self._last_fingerprint = fingerprint
+        if final and not pending_segments and self._latest_qwen_result is None:
+            pending_segments = list(segments)
+        if not final and not pending_segments:
+            self._debug(
+                "updater_write_update_skip",
+                final=final,
+                reason="no_pending_segments",
+            )
+            return None
+
+        batches = self._qwen_batches_for_update(pending_segments, final=final)
+        if not batches and self._latest_qwen_result is None:
+            self._debug(
+                "updater_write_update_skip",
+                final=final,
+                reason="no_batches_and_no_previous_result",
+            )
+            return None
 
         if self._qwen is None:
             self._qwen = self.qwen_factory()
-        result = self._qwen.generate(
-            segments,
-            max_new_tokens=self.max_new_tokens,
-            domain_terms=self.domain_terms,
-        )
+        result = self._latest_qwen_result
+        processed_segments: list[WhisperLiveSegment] = []
+        for batch_index, batch in enumerate(batches, start=1):
+            self._debug(
+                "updater_batch_start",
+                final=final,
+                batch_index=batch_index,
+                batch_count=len(batches),
+                batch_size=len(batch),
+                segments=qwen_debug_segments(batch),
+            )
+            try:
+                batch_result = self._qwen.generate(
+                    batch,
+                    max_new_tokens=self.max_new_tokens,
+                    domain_terms=self.domain_terms,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if final:
+                    self._debug(
+                        "updater_batch_error",
+                        final=final,
+                        batch_index=batch_index,
+                        error=str(exc),
+                        traceback=traceback.format_exc(),
+                    )
+                    raise
+                self._remember_failed_qwen_batch(batch)
+                log(
+                    "Qwen markdown batch failed; will retry with later context: "
+                    f"{exc}"
+                )
+                self._debug(
+                    "updater_batch_error",
+                    final=final,
+                    batch_index=batch_index,
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                    failed_retry_segments=len(self._failed_qwen_fingerprint),
+                )
+                continue
+            result = merge_markdown_results(result, batch_result)
+            processed_segments.extend(batch)
+            self._debug(
+                "updater_batch_done",
+                final=final,
+                batch_index=batch_index,
+                batch_result=qwen_debug_result(batch_result),
+                merged_result=qwen_debug_result(result),
+            )
+
+        if not processed_segments and not final:
+            self._debug(
+                "updater_write_update_skip",
+                final=final,
+                reason="no_processed_segments_after_batch_errors",
+            )
+            return None
+        if not has_structured_markdown_content(result):
+            self._debug(
+                "updater_write_update_error",
+                final=final,
+                reason="empty_structured_result",
+                result=qwen_debug_result(result or MarkdownResult([], [], [])),
+            )
+            raise RuntimeError(
+                "Qwen markdown result has no summary or sections: "
+                f"{format_markdown_result_counts(result)}"
+            )
         self._latest_qwen_result = result
+        output_segments = self.snapshot_segments() or segments
         markdown = render_markdown(
             result,
             source_file=self.input_path,
             whisper_model=self.whisper_model,
-            segments=segments,
+            segments=output_segments,
             update_status="final" if final else "streaming",
         )
         output_path = write_markdown(
@@ -1393,25 +2569,52 @@ class PeriodicMarkdownUpdater:
         update_status = "final" if final else "streaming"
         log(
             f"Wrote {update_status} Markdown update "
-            f"#{self.update_count} from {len(segments)} segment(s): {output_path}"
+            f"#{self.update_count} from {len(output_segments)} segment(s): {output_path}"
         )
+        self._debug(
+            "updater_write_update_done",
+            final=final,
+            update_count=self.update_count,
+            output_path=output_path,
+            update_status=update_status,
+            processed_segments=len(processed_segments),
+            result=qwen_debug_result(result),
+        )
+        recent_segments = processed_segments or segments[-max(5, self.min_update_segments) :]
         if self.on_markdown_update is not None:
             self.on_markdown_update(
                 markdown,
-                segments,
+                output_segments,
                 update_status,
                 self.update_count,
                 output_path,
                 recent_segments,
             )
+        if final:
+            self._last_fingerprint = fingerprint
+        elif processed_segments:
+            self._last_fingerprint = (
+                *self._last_fingerprint,
+                *self._fingerprint(processed_segments),
+            )
+            self._clear_failed_qwen_segments(processed_segments)
         return output_path
 
     def write_subtitle_snapshot(self, segments: list[WhisperLiveSegment]) -> Path | None:
         """Refresh the Markdown transcript section without invoking Qwen or the graph."""
         if not segments:
+            self._debug(
+                "subtitle_snapshot_skip",
+                reason="no_segments",
+            )
             return None
         fingerprint = self._fingerprint(segments)
         if fingerprint == self._last_subtitle_fingerprint:
+            self._debug(
+                "subtitle_snapshot_skip",
+                reason="unchanged_fingerprint",
+                segment_count=len(segments),
+            )
             return None
         self._last_subtitle_fingerprint = fingerprint
         result = self._latest_qwen_result or fallback_markdown_result(segments)
@@ -1433,10 +2636,16 @@ class PeriodicMarkdownUpdater:
             f"from {len(segments)} segment(s); "
             f"qwen_notes={'ready' if self._latest_qwen_result else 'pending'}: {output_path}"
         )
+        self._debug(
+            "subtitle_snapshot_written",
+            output_path=output_path,
+            segment_count=len(segments),
+            qwen_notes_ready=self._latest_qwen_result is not None,
+        )
         return output_path
 
     def _run(self) -> None:
-        next_qwen_update_at = time.monotonic() + max(0.0, self.update_every_seconds)
+        next_qwen_update_at = time.monotonic()
         next_subtitle_update_at = time.monotonic()
         while not self._stop_event.wait(1.0):
             try:
@@ -1449,15 +2658,16 @@ class PeriodicMarkdownUpdater:
                     self.write_subtitle_snapshot(segments)
                     next_subtitle_update_at = now + self.subtitle_update_every_seconds
 
-                first_qwen_update = self._last_fingerprint == ()
                 qwen_due = (
                     self.update_every_seconds > 0
                     and len(segments) >= self.min_update_segments
-                    and (first_qwen_update or now >= next_qwen_update_at)
+                    and now >= next_qwen_update_at
                 )
                 if qwen_due:
-                    self.write_update(segments, final=False)
-                    next_qwen_update_at = time.monotonic() + self.update_every_seconds
+                    try:
+                        self.write_update(segments, final=False)
+                    finally:
+                        next_qwen_update_at = time.monotonic() + self.update_every_seconds
             except Exception as exc:  # noqa: BLE001
                 log(f"Markdown periodic update failed: {exc}")
 
@@ -1465,22 +2675,81 @@ class PeriodicMarkdownUpdater:
     def _fingerprint(
         segments: list[WhisperLiveSegment],
     ) -> tuple[tuple[float, float, str], ...]:
-        return tuple((round(item.start, 2), round(item.end, 2), item.text) for item in segments)
+        return tuple(qwen_segment_fingerprint(item) for item in segments)
 
-    def _recent_segments_for_update(
+    def _pending_segments_for_update(
         self,
         segments: list[WhisperLiveSegment],
+        *,
+        final: bool,
     ) -> list[WhisperLiveSegment]:
-        """Return the new subtitle window since the previous Qwen notes update."""
+        """Return transcript segments not yet successfully consumed by Qwen."""
         previous = set(self._last_fingerprint)
-        recent = [
+        if final:
+            return [
+                segment
+                for segment in segments
+                if (round(segment.start, 2), round(segment.end, 2), segment.text) not in previous
+            ]
+
+        failed = set(self._failed_qwen_fingerprint)
+        failed_segments = [
             segment
             for segment in segments
-            if (round(segment.start, 2), round(segment.end, 2), segment.text) not in previous
+            if (round(segment.start, 2), round(segment.end, 2), segment.text) in failed
         ]
-        if recent:
-            return recent[-max(5, self.min_update_segments) :]
-        return segments[-max(5, self.min_update_segments) :]
+        new_segments = [
+            segment
+            for segment in segments
+            if (
+                qwen_segment_fingerprint(segment) not in previous
+                and qwen_segment_fingerprint(segment) not in failed
+            )
+        ]
+        if failed_segments and not new_segments:
+            return []
+        return [*failed_segments, *new_segments]
+
+    def _qwen_batches_for_update(
+        self,
+        pending_segments: list[WhisperLiveSegment],
+        *,
+        final: bool,
+    ) -> list[list[WhisperLiveSegment]]:
+        """Return small chronological batches so local Qwen can keep up."""
+        if not pending_segments:
+            return []
+        batch_size = self.max_qwen_segments_per_update
+        if not final:
+            failed_count = len(self._failed_qwen_fingerprint)
+            return [pending_segments[: max(batch_size, batch_size + failed_count)]]
+        return [
+            pending_segments[index : index + batch_size]
+            for index in range(0, len(pending_segments), batch_size)
+        ]
+
+    def _remember_failed_qwen_batch(self, batch: list[WhisperLiveSegment]) -> None:
+        """Remember a failed live batch without making final generation skip it."""
+        existing = list(self._failed_qwen_fingerprint)
+        seen = set(existing)
+        for item in self._fingerprint(batch):
+            if item in seen:
+                continue
+            seen.add(item)
+            existing.append(item)
+        self._failed_qwen_fingerprint = tuple(existing[-32:])
+
+    def _clear_failed_qwen_segments(self, segments: list[WhisperLiveSegment]) -> None:
+        """Remove successfully processed segments from the failed live retry set."""
+        processed = set(self._fingerprint(segments))
+        self._failed_qwen_fingerprint = tuple(
+            item for item in self._failed_qwen_fingerprint if item not in processed
+        )
+
+    def _debug(self, event: str, **fields: Any) -> None:
+        """Write a Qwen updater debug event if configured."""
+        if self.debug_logger is not None:
+            self.debug_logger.event(event, **fields)
 
 
 def clean_scalar(value: object) -> str:
@@ -1513,6 +2782,121 @@ def parse_domain_terms(raw_terms: str) -> list[str]:
     return clean_list(items)
 
 
+def load_session_transcript_segments(session_dir: Path) -> list[WhisperLiveSegment]:
+    """Load final transcript segments from a saved classroom timeline."""
+    timeline_path = session_dir / "timeline.json"
+    raw_items = json.loads(timeline_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_items, list):
+        raise ValueError(f"Expected timeline list in {timeline_path}")
+
+    segments: list[WhisperLiveSegment] = []
+    for item in raw_items:
+        if not isinstance(item, dict) or item.get("type") != "transcript":
+            continue
+        data = item.get("data")
+        if not isinstance(data, dict):
+            continue
+        if data.get("is_final") is False:
+            continue
+        text = str(data.get("text") or "").strip()
+        if not text:
+            continue
+        segments.append(
+            WhisperLiveSegment(
+                start=float(data.get("start_ts") or item.get("ts") or 0.0),
+                end=float(data.get("end_ts") or data.get("start_ts") or item.get("ts") or 0.0),
+                text=text,
+                completed=True,
+            )
+        )
+    return normalize_collected_segments(segments, completed_only=True)
+
+
+def finalize_session_notes(args: argparse.Namespace) -> Path:
+    """Generate final structured notes for an already-saved classroom session."""
+    session_id = args.finalize_session_id.strip()
+    session_dir = (
+        Path(args.finalize_session_dir)
+        if args.finalize_session_dir
+        else Path(args.sessions_dir) / session_id
+    )
+    if not session_id:
+        raise ValueError("--finalize-session-id is required")
+    if not session_dir.exists():
+        raise FileNotFoundError(f"Saved session directory not found: {session_dir}")
+
+    segments = load_session_transcript_segments(session_dir)
+    if not segments:
+        raise RuntimeError(f"No final transcript segments found in {session_dir}")
+
+    domain_terms = parse_domain_terms(args.domain_terms)
+    output_path = session_dir / "structured_notes.md"
+    debug_logger = QwenDebugLogger(qwen_debug_log_path(output_path))
+    if debug_logger.enabled:
+        log(f"Qwen debug log: {debug_logger.path}")
+    debug_logger.event(
+        "finalize_session_start",
+        session_id=session_id,
+        session_dir=session_dir,
+        segment_count=len(segments),
+        segments=qwen_debug_segments(segments),
+        qwen_model=args.qwen_model,
+        qwen_device=args.qwen_device,
+        qwen_tokens=args.qwen_tokens,
+        max_qwen_segments_per_update=getattr(
+            args,
+            "max_qwen_segments_per_update",
+            DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE,
+        ),
+    )
+    qwen = QwenMarkdownPolisher(
+        model_path=Path(args.qwen_model),
+        device=args.qwen_device,
+        debug_logger=debug_logger,
+    )
+    result = generate_incremental_markdown_result(
+        qwen,
+        segments,
+        max_new_tokens=args.qwen_tokens,
+        domain_terms=domain_terms,
+        max_qwen_segments_per_update=max(
+            1,
+            getattr(
+                args,
+                "max_qwen_segments_per_update",
+                DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE,
+            ),
+        ),
+        debug_logger=debug_logger,
+    )
+
+    markdown = render_markdown(
+        result,
+        source_file=session_dir / "transcript.md",
+        whisper_model=args.whisperlive_model,
+        segments=segments,
+        update_status="final",
+    )
+    write_markdown(
+        markdown,
+        output_dir=session_dir,
+        input_path=session_dir / "transcript.md",
+        output_path=output_path,
+    )
+    log(
+        "Final Qwen structured notes generated "
+        f"for session={session_id}: {output_path} "
+        f"{format_markdown_result_counts(result)}"
+    )
+    debug_logger.event(
+        "finalize_session_done",
+        session_id=session_id,
+        output_path=output_path,
+        result=qwen_debug_result(result),
+    )
+    return output_path
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -1534,6 +2918,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=str(DEFAULT_SESSIONS_DIR),
         help="Base directory for session-scoped Markdown output.",
     )
+    parser.add_argument(
+        "--finalize-session-id",
+        default="",
+        help=(
+            "Generate final structured_notes.md for an already saved session "
+            "from data/sessions/{session_id}/timeline.json, without ASR."
+        ),
+    )
+    parser.add_argument(
+        "--finalize-session-dir",
+        default="",
+        help="Optional explicit saved session directory for --finalize-session-id.",
+    )
     parser.add_argument("--backend-url", default=os.getenv("BACKEND_URL", "http://127.0.0.1:8000"))
     parser.add_argument(
         "--session-id",
@@ -1554,6 +2951,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--qwen-model", default=str(DEFAULT_QWEN_MODEL))
     parser.add_argument("--qwen-device", default=os.getenv("QWEN_DEVICE", "CPU"))
     parser.add_argument("--qwen-tokens", type=int, default=900)
+    parser.add_argument(
+        "--max-qwen-segments-per-update",
+        type=int,
+        default=int(os.getenv("QWEN_MAX_SEGMENTS_PER_UPDATE", DEFAULT_MAX_QWEN_SEGMENTS_PER_UPDATE)),
+        help=(
+            "Maximum new transcript segments sent to Qwen in one notes call. "
+            "Small batches keep local Qwen responsive during long classes."
+        ),
+    )
     parser.add_argument(
         "--update-every-seconds",
         type=float,
@@ -1615,6 +3021,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
     args = parse_args(argv or sys.argv[1:])
+    if args.finalize_session_id.strip():
+        finalize_session_notes(args)
+        return 0
+
     input_path = find_media(Path(args.input))
     log(f"Input media: {input_path}")
     log(f"WhisperLive server: {args.server}:{args.port}")
@@ -1663,10 +3073,14 @@ def main(argv: list[str] | None = None) -> int:
         sessions_dir=Path(args.sessions_dir),
     )
     domain_terms = parse_domain_terms(args.domain_terms)
+    debug_logger = QwenDebugLogger(qwen_debug_log_path(output_path))
+    if debug_logger.enabled:
+        log(f"Qwen debug log: {debug_logger.path}")
     updater = PeriodicMarkdownUpdater(
         qwen_factory=lambda: QwenMarkdownPolisher(
             model_path=Path(args.qwen_model),
             device=args.qwen_device,
+            debug_logger=debug_logger,
         ),
         snapshot_segments=lambda: client.snapshot_segments(completed_only=True),
         output_path=output_path,
@@ -1677,7 +3091,9 @@ def main(argv: list[str] | None = None) -> int:
         update_every_seconds=args.update_every_seconds,
         min_update_segments=max(1, args.min_update_segments),
         subtitle_update_every_seconds=max(0.0, args.subtitle_update_every_seconds),
+        max_qwen_segments_per_update=max(1, args.max_qwen_segments_per_update),
         on_markdown_update=syncer.enqueue_notes_update,
+        debug_logger=debug_logger,
     )
     log(f"Markdown output: {output_path}")
     if args.update_every_seconds > 0:

@@ -35,6 +35,10 @@ load_env_file() {
 }
 
 normalize_proxy_env() {
+  if [[ "${EDUMATE_NORMALIZE_SOCKS_PROXY:-0}" != "1" ]]; then
+    return 0
+  fi
+
   local name value
   for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
     value="${!name-}"
@@ -231,6 +235,28 @@ run_dev() {
   wait -n "$backend_pid" "$frontend_pid"
 }
 
+frontend_dist_is_stale() {
+  local dist_index="$ROOT_DIR/frontend/dist/index.html"
+  if [[ ! -f "$dist_index" || "${APP_REBUILD_FRONTEND:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local newer_source
+  newer_source="$(
+    find \
+      "$ROOT_DIR/frontend/src" \
+      "$ROOT_DIR/frontend/public" \
+      "$ROOT_DIR/frontend/index.html" \
+      "$ROOT_DIR/frontend/package.json" \
+      "$ROOT_DIR/frontend/package-lock.json" \
+      "$ROOT_DIR/frontend/tsconfig.json" \
+      "$ROOT_DIR/frontend/tsconfig.node.json" \
+      "$ROOT_DIR/frontend/vite.config.ts" \
+      -type f -newer "$dist_index" -print -quit 2>/dev/null || true
+  )"
+  [[ -n "$newer_source" ]]
+}
+
 run_app() {
   require_backend_venv
   require_frontend_deps
@@ -240,7 +266,7 @@ run_app() {
   load_env_file
   normalize_proxy_env
 
-  if [[ ! -f "$ROOT_DIR/frontend/dist/index.html" || "${APP_REBUILD_FRONTEND:-0}" == "1" ]]; then
+  if frontend_dist_is_stale; then
     echo "Building frontend for app mode..."
     run_build
   fi
@@ -366,6 +392,9 @@ start_app_microphone_stack() {
   fi
   if [[ -n "${APP_MIC_PARTIAL_PREVIEW_INTERVAL:-}" ]]; then
     mic_args+=(--partial-preview-interval "$APP_MIC_PARTIAL_PREVIEW_INTERVAL")
+  fi
+  if [[ -n "${APP_QWEN_MAX_SEGMENTS_PER_UPDATE:-}" ]]; then
+    mic_args+=(--max-qwen-segments-per-update "$APP_QWEN_MAX_SEGMENTS_PER_UPDATE")
   fi
   (
     mic_child_pid=""

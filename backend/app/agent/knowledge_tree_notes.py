@@ -91,7 +91,10 @@ class MarkdownKnowledgeTreeAgent:
         """Ask the cloud model for a grounded knowledge tree update."""
         markdown_hash = normalized_markdown_hash(request)
         self._latest_markdown[request.session_id] = request.markdown
-        if self.has_processed(request.session_id, markdown_hash):
+        if (
+            request.update_status != "final"
+            and self.has_processed(request.session_id, markdown_hash)
+        ):
             return NotesGraphExtractionResult(
                 markdown_hash=markdown_hash,
                 warnings=("Markdown snapshot already processed; skipped duplicate.",),
@@ -375,7 +378,7 @@ class MarkdownKnowledgeTreeAgent:
                 }
                 for segment in request.source_segments
             ],
-            markdown=request.markdown,
+            markdown=markdown_without_whisperlive_subtitles(request.markdown),
             recent_source_segments=[
                 {
                     "segment_id": segment.segment_id,
@@ -386,6 +389,26 @@ class MarkdownKnowledgeTreeAgent:
                 for segment in focused_source_segments(request)
             ],
         )
+
+
+_WHISPERLIVE_SUBTITLE_HEADING_RE = re.compile(
+    r"^##\s*(?:WhisperLive\s+Subtitles|WhisperLive\s+字幕|Subtitles|字幕|语音字幕)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def markdown_without_whisperlive_subtitles(markdown: str) -> str:
+    """Remove the raw WhisperLive subtitle appendix before cloud graph prompts.
+
+    The saved ``structured_notes.md`` intentionally keeps the subtitle appendix
+    for auditing, but sending that whole appendix to the cloud graph agent makes
+    final requests unnecessarily large and encourages subtitle-shaped graph
+    outputs. Keep the actual notes and drop only the raw subtitle section.
+    """
+    match = _WHISPERLIVE_SUBTITLE_HEADING_RE.search(markdown)
+    if not match:
+        return markdown
+    return markdown[: match.start()].rstrip() + "\n"
 
 
 def normalized_markdown_hash(request: NotesKnowledgeTreeUpdateRequest) -> str:

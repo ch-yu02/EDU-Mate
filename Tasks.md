@@ -12,6 +12,7 @@
 - [x] Agent chat: QA / summary / todos / quiz.
 - [x] Strict and grounded QA modes.
 - [x] Post-class `summary.md` and `todos.json`; on-demand `quiz.json`.
+- [x] Persist post-class generation status and surface interrupted generation as failed.
 - [x] Agent messages and artifacts persistence.
 - [x] Lexical RAG, optional single-classroom LlamaIndex, optional global index.
 - [x] Cloud/local OpenAI-compatible LLM provider support.
@@ -26,6 +27,9 @@
 - [x] Local Qwen generates structured classroom notes without rewriting realtime subtitles.
 - [x] Cloud notes-agent can infer final classroom title/course from notes.
 - [x] Notes-agent endpoint for Markdown-driven graph updates.
+- [x] Post-class generation is staged: final Qwen notes publish first, summary/todos
+  artifacts and final graph update run independently, and each stage records status
+  and timing.
 - [x] Auto attach/create session support for local audio scripts.
 - [x] Compact Agent source refs; no full subtitle dump in source display.
 - [x] Strict QA can use LLM for natural source-only answers with fallback.
@@ -44,13 +48,15 @@
   and relationship-cluster layout.
 - [x] App mode can launch backend, built frontend preview, WhisperLive server,
   and microphone capture from one command or desktop shortcut.
+- [x] Deleting a saved classroom cancels/guards post-class background writes so
+  deleted session directories are not recreated.
 
 ## P0: Integration Reliability
 
 - [ ] Run a full WhisperLive/Qwen/notes-agent classroom test with real provider.
 - [ ] Confirm iGPU WhisperLive model choice and latency target on device.
 - [ ] Confirm Qwen CPU structured-notes cadence that does not block ASR.
-- [ ] Confirm cloud graph update cadence and timeout settings.
+- [ ] Confirm cloud graph update cadence and stage-specific timeout settings.
 - [ ] Verify frontend can attach to script-created recording sessions reliably on the target device.
 - [ ] Add a concise full-chain manual test record with observed timings.
 - [ ] Validate browser camera permission/device behavior on the target board.

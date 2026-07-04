@@ -92,6 +92,62 @@ class SkillsTest(unittest.TestCase):
         self.assertEqual(todo["source_refs"][0]["id"], "seg_001")
         self.assertTrue(result.warnings)
 
+    def test_todo_detective_generates_study_todos_without_explicit_assignment(self) -> None:
+        quiet_context = ClassroomContext(
+            session_id=self.session_id,
+            transcript=[
+                TranscriptSegment(
+                    segment_id="seg_002",
+                    session_id=self.session_id,
+                    start_ts=4.0,
+                    end_ts=8.0,
+                    text="今天重点介绍采样定理的条件和频谱混叠现象。",
+                )
+            ],
+        )
+
+        result = TodoDetectiveSkill().run(self.session_id, quiet_context, self.graph)
+
+        self.assertIsNotNone(result.artifact)
+        todos = result.artifact.content
+        self.assertGreaterEqual(len(todos), 3)
+        self.assertLessEqual(len(todos), 5)
+        self.assertTrue(all(todo["type"] != "candidate" for todo in todos))
+        self.assertTrue(all(todo["confidence"] <= 0.65 for todo in todos))
+        self.assertIn("不代表老师明确布置", result.warnings[0])
+        self.assertEqual(result.source_refs[0].id, "node_sampling")
+
+    def test_todo_detective_generates_english_study_todos_for_english_class(self) -> None:
+        english_context = ClassroomContext(
+            session_id=self.session_id,
+            transcript=[
+                TranscriptSegment(
+                    segment_id="seg_en",
+                    session_id=self.session_id,
+                    start_ts=1.0,
+                    end_ts=5.0,
+                    text="Today we discussed Fourier transform and frequency domain analysis.",
+                )
+            ],
+        )
+        english_graph = KnowledgeTree(
+            session_id=self.session_id,
+            nodes=[
+                KnowledgeNode(
+                    node_id="node_fourier",
+                    label="Fourier transform",
+                    summary="A transform from time domain to frequency domain.",
+                )
+            ],
+        )
+
+        result = TodoDetectiveSkill().run(self.session_id, english_context, english_graph)
+
+        self.assertIsNotNone(result.artifact)
+        first_title = result.artifact.content[0]["title"]
+        self.assertIn("Review", first_title)
+        self.assertIn("Fourier transform", first_title)
+
     def test_quiz_master_prefers_knowledge_nodes(self) -> None:
         result = QuizMasterSkill().run(self.session_id, self.context, self.graph)
 
@@ -185,6 +241,28 @@ class SkillsTest(unittest.TestCase):
         self.assertEqual(len(result.artifact.content), 3)
         self.assertEqual(result.artifact.content[0]["type"], "generated_review")
         self.assertTrue(result.warnings)
+
+    def test_todo_detective_falls_back_when_llm_returns_empty_todos(self) -> None:
+        quiet_context = ClassroomContext(
+            session_id=self.session_id,
+            transcript=[
+                TranscriptSegment(
+                    segment_id="seg_003",
+                    session_id=self.session_id,
+                    start_ts=8.0,
+                    end_ts=12.0,
+                    text="今天重点介绍频谱混叠现象。",
+                )
+            ],
+        )
+
+        result = TodoDetectiveSkill(
+            llm_client=FakeLLMClient({"todos": []})
+        ).run(self.session_id, quiet_context, self.graph)
+
+        self.assertIsNotNone(result.artifact)
+        self.assertGreaterEqual(len(result.artifact.content), 3)
+        self.assertIn("已使用本地学习建议兜底", result.warnings[0])
 
     def test_quiz_master_uses_llm_payload_when_client_is_available(self) -> None:
         result = QuizMasterSkill(

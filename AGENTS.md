@@ -104,7 +104,14 @@ POST /sessions/{session_id}/end
 -> frontend finalizes the current preview subtitle if one is visible
 -> data/sessions/{session_id}/...
 -> session.ended returns quickly with post_class_status=generating
--> background summary/todos/final extraction/index work
+-> background local Qwen final structured notes
+-> post_class.updated stage=notes_ready
+-> summary/todos/title/index artifacts and final notes graph update run as
+   separate background stages
+-> post_class.updated stage=artifacts_ready / graph_ready / done
+-> post_class_status.json records stage, steps, ready/failed, and graph finality;
+   interrupted in-process work is
+   surfaced as failed on next history read
 -> POST /agent/chat
 -> POST /agent/search
 -> POST /agent/review
@@ -215,6 +222,7 @@ data/sessions/{session_id}/transcript.md
 data/sessions/{session_id}/structured_notes.md
 data/sessions/{session_id}/timeline.json
 data/sessions/{session_id}/knowledge_graph.json
+data/sessions/{session_id}/post_class_status.json
 data/sessions/{session_id}/summary.md
 data/sessions/{session_id}/todos.json
 data/sessions/{session_id}/quiz.json
@@ -266,7 +274,6 @@ scripts/dev.sh whisperlive-md --enable-cloud-graph --max-audio-seconds 300
 
 - `AGENTS.md`: compact project guide.
 - `Tasks.md`: active roadmap and checklist.
-- `docs/API_SCHEMA.md`: HTTP/WebSocket/Agent API schema.
-- `docs/INPUT_DATA_CONTRACT.md`: ASR/camera/hardware input contract.
+- `docs/API_SCHEMA.md`: HTTP/WebSocket/Agent API schema and ASR/camera/hardware input contract.
 - `docs/LLM_PROVIDER_SETUP.md`: Kimi/DeepSeek/OpenAI/local provider setup.
 - `docs/PACKAGING_PLAN.md`: app launcher, desktop shortcut, and packaging plan.

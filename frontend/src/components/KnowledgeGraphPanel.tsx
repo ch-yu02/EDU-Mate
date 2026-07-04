@@ -12,6 +12,7 @@ import type { GlobalSearchSourceRef } from "../types/agent";
 import type {
   KnowledgeEdge,
   KnowledgeGraphView,
+  KnowledgeGraphStatus,
   KnowledgeNode,
   ImageCapture,
   SourceRef,
@@ -30,7 +31,7 @@ import type {
 type KnowledgeGraphPanelProps = {
   graph: KnowledgeGraphView;
   focusedSource?: GlobalSearchSourceRef | null;
-  isFinal?: boolean;
+  status?: KnowledgeGraphStatus;
   transcript?: TranscriptSegment[];
   visuals?: ImageCapture[];
 };
@@ -40,7 +41,7 @@ type GraphViewMode = "list" | "graph";
 export function KnowledgeGraphPanel({
   graph,
   focusedSource,
-  isFinal = false,
+  status = "live",
   transcript = [],
   visuals = [],
 }: KnowledgeGraphPanelProps) {
@@ -62,7 +63,7 @@ export function KnowledgeGraphPanel({
       <div className="panel-header">
         <div>
           <h2 id="graph-title">知识图谱</h2>
-          <span>{isFinal ? "final" : `v${graph.version}`}</span>
+          <span>{knowledgeGraphStatusLabel(status, graph.version)}</span>
         </div>
         <strong>{graph.nodes.length}</strong>
       </div>
@@ -115,6 +116,19 @@ export function KnowledgeGraphPanel({
       )}
     </section>
   );
+}
+
+function knowledgeGraphStatusLabel(status: KnowledgeGraphStatus, version: number): string {
+  if (status === "final") {
+    return "final";
+  }
+  if (status === "finalizing") {
+    return "finalizing";
+  }
+  if (status === "failed") {
+    return "final failed";
+  }
+  return `v${version}`;
 }
 
 type KnowledgeGraphListProps = {

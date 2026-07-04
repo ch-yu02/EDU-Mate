@@ -20,7 +20,9 @@ from .knowledge import (
     KnowledgeTree,
 )
 from .session import (
+    KnowledgeGraphStatus,
     LectureSession,
+    PostClassStatus,
     SessionDeleteResponse,
     SessionHistoryDetail,
     SessionHistoryListResponse,
@@ -44,10 +46,12 @@ __all__ = [
     "KnowledgeEdge",
     "KnowledgeEntity",
     "KnowledgeExtraction",
+    "KnowledgeGraphStatus",
     "KnowledgeNode",
     "KnowledgeRelation",
     "KnowledgeTree",
     "LectureSession",
+    "PostClassStatus",
     "RealtimeEvent",
     "SessionHistoryDetail",
     "SessionDeleteResponse",

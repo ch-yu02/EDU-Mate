@@ -56,8 +56,9 @@ Planned:
 - Add a small local status endpoint for readiness checks.
 - Persist user-facing logs for startup failures, model/API failures, and device
   permission issues.
-- Keep classroom end fast: save the session immediately, then finish summary,
-  quiz, todo, graph, and index generation in background tasks.
+- Keep classroom end fast: save the session immediately, publish final Qwen
+  notes as soon as they are ready, then finish summary/todos/title, final graph,
+  quiz-on-demand, and optional index generation in background tasks.
 
 ## Phase 4: Distribution
 

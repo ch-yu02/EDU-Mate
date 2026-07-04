@@ -274,6 +274,33 @@ class LocalStorageTest(unittest.TestCase):
         detail = self.storage.read_session(self.session_id)
         self.assertIn("傅里叶变换是重点", detail.structured_notes_markdown)
 
+    def test_post_class_status_persists_knowledge_graph_status(self) -> None:
+        self.storage.save_session(
+            session=self._session(),
+            context=self._context(),
+            knowledge_graph=self._knowledge_graph(),
+        )
+        self.storage.save_post_class_status(
+            self.session_id,
+            "generating",
+            knowledge_graph_status="finalizing",
+        )
+
+        generating_detail = self.storage.read_session(self.session_id)
+
+        self.assertEqual(generating_detail.post_class_status, "generating")
+        self.assertEqual(generating_detail.knowledge_graph_status, "finalizing")
+
+        self.storage.save_post_class_status(
+            self.session_id,
+            "ready",
+            knowledge_graph_status="final",
+        )
+        ready_detail = self.storage.read_session(self.session_id)
+
+        self.assertEqual(ready_detail.post_class_status, "ready")
+        self.assertEqual(ready_detail.knowledge_graph_status, "final")
+
     def test_save_agent_artifacts_writes_post_class_outputs(self) -> None:
         self.storage.save_session(
             session=self._session(),

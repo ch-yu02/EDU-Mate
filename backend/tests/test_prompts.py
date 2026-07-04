@@ -90,6 +90,48 @@ class PromptTemplatesTest(unittest.TestCase):
         self.assertNotIn("clean_transcript", prompt)
         self.assertIn("线性代数、矩阵", prompt)
 
+    def test_qwen_markdown_prompt_uses_english_instructions_for_english_class(self) -> None:
+        prompt = prompts.qwen_markdown_notes_prompt(
+            segments=[
+                {
+                    "id": "seg_whisperlive_001",
+                    "start": 0.0,
+                    "end": 5.0,
+                    "text": "DNS translates host names to IP addresses.",
+                }
+            ],
+            domain_terms=["DNS", "IP address"],
+        )
+
+        self.assertIn("TARGET_OUTPUT_LANGUAGE: English", prompt)
+        self.assertIn("Do not translate the lecture into Chinese", prompt)
+        self.assertIn("Key point in English", prompt)
+        self.assertIn("source_segment_ids", prompt)
+        self.assertIn("seg_whisperlive_001", prompt)
+        self.assertIn("DNS, IP address", prompt)
+        self.assertNotIn("你是一个课堂笔记整理助手", prompt)
+        self.assertNotIn("要点1", prompt)
+
+    def test_qwen_markdown_retry_prompt_keeps_english_language_constraint(self) -> None:
+        prompt = prompts.qwen_markdown_notes_quality_retry_prompt(
+            segments=[
+                {
+                    "id": "seg_whisperlive_001",
+                    "start": 0.0,
+                    "end": 5.0,
+                    "text": "DNS translates host names to IP addresses.",
+                }
+            ],
+            domain_terms=[],
+            previous_output='{"summary":["DNS 是域名系统"]}',
+            reason="language mismatch",
+        )
+
+        self.assertIn("TARGET_OUTPUT_LANGUAGE: English", prompt)
+        self.assertIn("Do not output Chinese", prompt)
+        self.assertIn("Regenerated valid JSON", prompt)
+        self.assertNotIn("重新输出合法 JSON", prompt)
+
     def test_markdown_knowledge_tree_prompt_includes_existing_graph_context(self) -> None:
         prompt = prompts.markdown_knowledge_tree_user_prompt(
             session_id="lec_notes",

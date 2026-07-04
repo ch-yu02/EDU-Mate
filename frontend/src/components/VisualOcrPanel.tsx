@@ -793,7 +793,11 @@ function VisualAnalysisDetail({
           {isAnalyzing || visual.status === "processing" ? (
             <span className="visual-analysis-status">分析中</span>
           ) : null}
-          <button type="button" onClick={onOpenImageViewer}>
+          <button
+            className="visual-fullscreen-button"
+            type="button"
+            onClick={onOpenImageViewer}
+          >
             全屏
           </button>
         </div>

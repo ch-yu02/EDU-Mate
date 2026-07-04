@@ -249,8 +249,18 @@ describe("classroomReducer", () => {
         type: "post_class.updated",
         session_id: "lec_test",
         created_at: "2026-06-05T00:00:00.000000+00:00",
-        data: {
-          status: "ready",
+          data: {
+            status: "ready",
+            knowledge_graph_status: "final",
+            session: {
+              session_id: "lec_test",
+            title: "Web and HTTP (Part 1)",
+            start_time: "2026-06-05T00:00:00+08:00",
+            end_time: "2026-06-05T01:00:00+08:00",
+            status: "ended",
+            language: "zh-CN",
+            created_by: "student",
+          },
           post_class_artifacts: {
             summary_markdown: "这是一份后台生成的总结。",
             todos: [{ title: "复习第一章", confidence: 0.7 }],
@@ -263,7 +273,10 @@ describe("classroomReducer", () => {
     });
 
     expect(endedState.postClassStatus).toBe("generating");
+    expect(endedState.knowledgeGraphStatus).toBe("finalizing");
     expect(readyState.postClassStatus).toBe("ready");
+    expect(readyState.knowledgeGraphStatus).toBe("final");
+    expect(readyState.session?.title).toBe("Web and HTTP (Part 1)");
     expect(readyState.postClassArtifacts.summary_markdown).toContain("后台生成");
     expect(readyState.postClassArtifacts.todos[0].title).toBe("复习第一章");
   });
@@ -746,6 +759,20 @@ describe("classroomReducer", () => {
     });
 
     expect(deletedState).toEqual(loadedState);
+  });
+
+  it("uses persisted post-class status when loading history", () => {
+    const state = classroomReducer(initialDashboardState, {
+      type: "history.loaded",
+      detail: {
+        ...historyDetail("lec_history_failed_post_class"),
+        post_class_status: "failed" as const,
+        post_class_warnings: ["Post-class generation was interrupted."],
+      },
+    });
+
+    expect(state.postClassStatus).toBe("failed");
+    expect(state.knowledgeGraphStatus).toBe("failed");
   });
 });
 

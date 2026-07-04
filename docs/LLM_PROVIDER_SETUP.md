@@ -29,8 +29,8 @@ LLM_MODEL=deepseek-v4-flash
 LLM_BASE_URL=https://api.deepseek.com
 LLM_TIMEOUT_SECONDS=30
 LLM_MAX_RETRIES=1
-NO_PROXY=localhost,127.0.0.1,api.moonshot.cn,.moonshot.cn,api.deepseek.com,.deepseek.com,api.openai.com,.openai.com
-no_proxy=localhost,127.0.0.1,api.moonshot.cn,.moonshot.cn,api.deepseek.com,.deepseek.com,api.openai.com,.openai.com
+NO_PROXY=localhost,127.0.0.1
+no_proxy=localhost,127.0.0.1
 ```
 
 Local development commands in `scripts/dev.sh` load `.env` automatically for
@@ -65,16 +65,31 @@ For image analysis, the configured model must support OpenAI-compatible
 multimodal chat content. A text-only model can still power QA and graph
 extraction, but `/agent/visual/analyze` will fail with a warning.
 
-If the device uses a system proxy, keep cloud LLM API hosts in `NO_PROXY` /
-`no_proxy` when direct access is more stable. The backend uses Python standard
-library HTTP calls, so these environment variables control whether proxy
-settings are bypassed for provider domains.
+If the device uses a system proxy, leave proxy routing to the system or shell
+environment unless a provider explicitly requires bypassing it. The project
+defaults only exclude local backend/frontend addresses in `NO_PROXY` /
+`no_proxy`; adding cloud API hosts is a local deployment choice, not a project
+default.
 
 Image analysis has an extra retry-friendly timeout behavior: the first request
 uses `LLM_TIMEOUT_SECONDS`; if the same image fails and the recording frontend
 retries with `force=true`, the visual analysis agent increases the timeout for
 that image up to a capped value. This avoids blocking the initial photo capture
 while still giving slow multimodal calls more room on retry.
+
+Post-class generation also has stage-specific cloud timeouts so one slow cloud
+step does not hide completed local notes or other artifacts:
+
+```bash
+POST_CLASS_GRAPH_LLM_TIMEOUT_SECONDS=45
+POST_CLASS_GRAPH_LLM_MAX_RETRIES=0
+POST_CLASS_ARTIFACT_LLM_TIMEOUT_SECONDS=45
+POST_CLASS_ARTIFACT_LLM_MAX_RETRIES=0
+```
+
+The local Qwen final notes stage is controlled separately by
+`POST_CLASS_QWEN_NOTES_TIMEOUT_SECONDS` and related `POST_CLASS_*QWEN*`
+variables.
 
 ## Vector RAG / LlamaIndex
 

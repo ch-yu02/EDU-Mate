@@ -26,6 +26,12 @@ SessionStatus = Literal["recording", "ended"]
 - ``"ended"``     —— 已结束
 """
 
+PostClassStatus = Literal["idle", "generating", "ready", "failed"]
+"""课后产物生成状态。"""
+
+KnowledgeGraphStatus = Literal["live", "finalizing", "final", "failed"]
+"""知识图谱最终化状态。"""
+
 
 # ── 工具函数 ────────────────────────────────────────────────────
 
@@ -173,6 +179,12 @@ class SessionHistoryDetail(BaseModel):
         default_factory=lambda: SessionPostClassArtifacts()
     )
     """课后产物读取结果，包括 summary/todos/quiz/agent_artifacts。"""
+    post_class_status: PostClassStatus = "ready"
+    """课后产物生成状态。"""
+    post_class_warnings: list[str] = Field(default_factory=list)
+    """课后产物生成过程中的非致命提示或失败原因。"""
+    knowledge_graph_status: KnowledgeGraphStatus = "final"
+    """知识图谱状态；final 表示最终全量图谱抽取已经完成。"""
 
 
 class SessionPostClassArtifacts(BaseModel):

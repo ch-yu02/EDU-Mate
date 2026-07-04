@@ -44,7 +44,13 @@ from backend.app.core import (
     session_manager,
     websocket_manager,
 )
-from backend.app.models import ContextUpdate, GraphPatch, RealtimeEvent, WebSocketMessage
+from backend.app.models import (
+    ContextUpdate,
+    GraphPatch,
+    LectureSession,
+    RealtimeEvent,
+    WebSocketMessage,
+)
 from backend.app.storage import local_storage
 
 
@@ -274,11 +280,13 @@ async def update_knowledge_tree_from_notes(
             session_title=result.session_title,
             course=result.course,
         )
+        persisted_notes = _persist_notes_snapshot_if_saved(request)
         elapsed = time.monotonic() - started_at
         _notes_agent_log(
             "skipped "
             f"session={request.session_id} snapshot={request.snapshot_id} "
             f"elapsed={elapsed:.2f}s metadata_updated={metadata_updated} "
+            f"persisted={persisted_notes} "
             f"warnings={list(result.warnings)}"
         )
         return NotesKnowledgeTreeUpdateResponse(
@@ -322,12 +330,14 @@ async def update_knowledge_tree_from_notes(
         session_title=result.session_title,
         course=result.course,
     )
+    persisted_notes = _persist_notes_snapshot_if_saved(request)
     elapsed = time.monotonic() - started_at
     _notes_agent_log(
         f"{'applied' if operation_count else 'skipped'} "
         f"session={request.session_id} snapshot={request.snapshot_id} "
         f"elapsed={elapsed:.2f}s ops={operation_count} "
         f"metadata_updated={metadata_updated} "
+        f"persisted={persisted_notes} "
         f"extraction={result.extraction.extraction_id} warnings={list(result.warnings)}"
     )
     return NotesKnowledgeTreeUpdateResponse(
@@ -342,6 +352,42 @@ async def update_knowledge_tree_from_notes(
         session_metadata_updated=metadata_updated,
         warnings=list(result.warnings),
     )
+
+
+def _persist_notes_snapshot_if_saved(request: NotesKnowledgeTreeUpdateRequest) -> bool:
+    """Persist late notes-driven updates for a session already saved to disk."""
+    if not local_storage.session_exists(request.session_id):
+        return False
+
+    try:
+        session = session_manager.get_session(request.session_id)
+    except SessionNotFoundError:
+        try:
+            session = LectureSession.model_validate(
+                local_storage.read_metadata(request.session_id)
+            )
+        except (FileNotFoundError, ValueError):
+            return False
+
+    try:
+        context = context_manager.get_context(request.session_id)
+        knowledge_graph = knowledge_graph_manager.get_graph(request.session_id)
+    except (
+        ContextNotFoundError,
+        KnowledgeGraphNotFoundError,
+        FileNotFoundError,
+        ValueError,
+    ):
+        return False
+
+    local_storage.save_session(
+        session=session,
+        context=context,
+        knowledge_graph=knowledge_graph,
+        structured_notes_markdown=request.markdown,
+        create=False,
+    )
+    return True
 
 
 async def _update_session_metadata_from_notes(

@@ -7,6 +7,7 @@ from backend.scripts.whisperlive_microphone import (
     TranscriptPreviewSyncer,
     choose_audio_device,
     ffmpeg_microphone_command,
+    iter_microphone_packets,
     parse_arecord_devices,
     parse_args,
     resolve_or_wait_backend_session_id,
@@ -65,6 +66,57 @@ card 1: Device [USB Audio Device], device 0: USB Audio [USB Audio]
         self.assertIn("-ar", command)
         self.assertIn("16000", command)
         self.assertEqual(command[-2:], ["f32le", "pipe:1"])
+
+    def test_iter_microphone_packets_treats_requested_stop_as_normal(self) -> None:
+        class FakePipe:
+            def read(self, _size):  # type: ignore[no-untyped-def]
+                return b""
+
+            def readline(self):  # type: ignore[no-untyped-def]
+                return b""
+
+            def close(self) -> None:
+                pass
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = FakePipe()
+                self.stderr = FakePipe()
+                self.return_code: int | None = None
+
+            def poll(self) -> int | None:
+                return self.return_code
+
+            def terminate(self) -> None:
+                self.return_code = -15
+
+            def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+                return self.return_code
+
+            def kill(self) -> None:
+                self.return_code = -9
+
+        process = FakeProcess()
+        original_popen = mic_module.subprocess.Popen
+        mic_module.subprocess.Popen = lambda *_args, **_kwargs: process  # type: ignore[assignment]
+        stop_event = threading.Event()
+        stop_event.set()
+        try:
+            packets = list(
+                iter_microphone_packets(
+                    ffmpeg="/usr/bin/ffmpeg",
+                    audio_device="default",
+                    packet_seconds=0.25,
+                    max_audio_seconds=0.0,
+                    sample_rate=16000,
+                    stop_event=stop_event,
+                )
+            )
+        finally:
+            mic_module.subprocess.Popen = original_popen
+
+        self.assertEqual(packets, [])
+        self.assertEqual(process.return_code, -15)
 
     def test_transcript_preview_syncer_posts_non_persistent_preview(self) -> None:
         calls: list[tuple[str, str, dict, float]] = []

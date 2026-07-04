@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { EmptyState } from "./EmptyState";
+import { MarkdownContent } from "./MarkdownContent";
 import type { PostClassStatus, SessionPostClassArtifacts } from "../types/classroom";
 
 // 课后产物面板。
@@ -110,7 +111,7 @@ export function PostClassArtifactsPanel({
         ) : null}
 
         {/* 旧历史课堂可能没有这些文件；正在录制的课堂也不会有历史产物。 */}
-        {isGenerating && totalCount === 0 ? (
+        {(isGenerating || isFailed) && totalCount === 0 ? (
           <EmptyState label={contentEmptyLabel} />
         ) : activeTab === "summary" ? (
           <SummaryView summary={artifacts.summary_markdown} />
@@ -129,7 +130,12 @@ function SummaryView({ summary }: { summary?: string | null }) {
     return <EmptyState label="暂无总结" />;
   }
 
-  return <p className="post-class-summary">{summary}</p>;
+  return (
+    <MarkdownContent
+      className="post-class-summary post-class-summary-markdown"
+      content={summary}
+    />
+  );
 }
 
 function TodoView({ todos }: { todos: Array<Record<string, unknown>> }) {

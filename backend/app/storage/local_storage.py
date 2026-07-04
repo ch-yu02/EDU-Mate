@@ -41,12 +41,15 @@ from pydantic import ValidationError
 
 from backend.app.models import (
     ClassroomContext,
+    KnowledgeGraphStatus,
     KnowledgeTree,
     LectureSession,
+    PostClassStatus,
     SessionHistoryDetail,
     SessionPostClassArtifacts,
     SessionHistorySummary,
     TimelineItem,
+    utc_now_iso,
 )
 
 
@@ -82,6 +85,8 @@ class LocalStorage:
         context: ClassroomContext,
         knowledge_graph: KnowledgeTree,
         structured_notes_markdown: str | None = None,
+        *,
+        create: bool = True,
     ) -> StorageWriteResult:
         """Persist all MVP classroom artifacts for one ended session.
 
@@ -94,7 +99,10 @@ class LocalStorage:
           - knowledge_graph.json：完整知识图谱快照
         """
         session_dir = self.session_dir(session.session_id)
-        session_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        elif not session_dir.exists() or not session_dir.is_dir():
+            raise FileNotFoundError(f"Saved session not found: {session.session_id}")
 
         files = {
             "metadata": session_dir / "metadata.json",
@@ -354,6 +362,7 @@ class LocalStorage:
             knowledge_graph=knowledge_graph,
             storage_path=str(session_dir),
             post_class_artifacts=self._read_post_class_artifacts(session_dir),
+            **self._read_post_class_status(session_dir),
         )
 
     def save_agent_artifacts(
@@ -425,6 +434,44 @@ class LocalStorage:
         self._write_json(snapshot_path, merged_artifacts)
         written["agent_artifacts"] = snapshot_path
         return written
+
+    def save_post_class_status(
+        self,
+        session_id: str,
+        status: PostClassStatus,
+        *,
+        warnings: list[str] | None = None,
+        knowledge_graph_status: KnowledgeGraphStatus | None = None,
+        stage: str | None = None,
+        steps: dict[str, object] | None = None,
+    ) -> Path:
+        """Persist post-class background generation status for history recovery.
+
+        This method intentionally requires an existing saved session directory.
+        It must not recreate a classroom that the user has deleted while a
+        background task was still running.
+        """
+        session_dir = self._safe_session_dir(session_id)
+        if not session_dir.exists() or not session_dir.is_dir():
+            raise FileNotFoundError(f"Saved session not found: {session_id}")
+
+        path = session_dir / "post_class_status.json"
+        self._write_json(
+            path,
+            {
+                "status": status,
+                "warnings": warnings or [],
+                **({"stage": stage} if stage else {}),
+                **({"steps": steps} if steps else {}),
+                **(
+                    {"knowledge_graph_status": knowledge_graph_status}
+                    if knowledge_graph_status
+                    else {}
+                ),
+                "updated_at": utc_now_iso(),
+            },
+        )
+        return path
 
     def append_agent_messages(
         self,
@@ -605,6 +652,54 @@ class LocalStorage:
                 else []
             ),
         )
+
+    def _read_post_class_status(self, session_dir: Path) -> dict[str, object]:
+        """Read persisted post-class generation status.
+
+        Old sessions do not have this file; treat them as ready so historical
+        playback stays compatible.
+        """
+        status_path = session_dir / "post_class_status.json"
+        if not status_path.exists():
+            return {
+                "post_class_status": "ready",
+                "post_class_warnings": [],
+                "knowledge_graph_status": "final",
+            }
+
+        data = self._read_json(status_path)
+        status = data.get("status")
+        if status not in {"idle", "generating", "ready", "failed"}:
+            status = "failed"
+        warnings = data.get("warnings")
+        graph_status = data.get("knowledge_graph_status")
+        if graph_status not in {"live", "finalizing", "final", "failed"}:
+            graph_status = self._infer_legacy_knowledge_graph_status(
+                status,
+                warnings if isinstance(warnings, list) else [],
+            )
+        return {
+            "post_class_status": status,
+            "post_class_warnings": warnings if isinstance(warnings, list) else [],
+            "knowledge_graph_status": graph_status,
+        }
+
+    @staticmethod
+    def _infer_legacy_knowledge_graph_status(
+        post_class_status: object,
+        warnings: list[object],
+    ) -> KnowledgeGraphStatus:
+        """Infer graph finalization for status files written before this field existed."""
+        if post_class_status == "generating":
+            return "finalizing"
+        warning_text = "\n".join(str(item) for item in warnings)
+        if (
+            post_class_status == "failed"
+            or "Final Qwen structured notes failed" in warning_text
+            or "Final knowledge extraction failed" in warning_text
+        ):
+            return "failed"
+        return "final"
 
     def _merge_agent_artifacts(
         self,

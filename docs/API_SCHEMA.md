@@ -236,6 +236,9 @@ Content-Type: application/json
 | `knowledge_graph` | `KnowledgeTree` | `knowledge_graph.json` 的图谱快照 |
 | `storage_path` | string | 本地历史课堂目录 |
 | `post_class_artifacts` | object | `summary.md`、`todos.json`、`quiz.json`、Agent artifact 和消息记录 |
+| `post_class_status` | string | `idle` / `generating` / `ready` / `failed` |
+| `post_class_warnings` | string[] | 课后产物生成提示或失败原因 |
+| `knowledge_graph_status` | string | `finalizing` / `final` / `failed`；`final` 表示最终图谱已经基于 final notes 更新完成 |
 
 错误：
 
@@ -246,7 +249,9 @@ Content-Type: application/json
 ### DELETE /sessions/{session_id}/history
 
 删除一节已保存课堂的本地历史目录。只影响磁盘历史数据，不会把已经结束的
-内存课堂恢复或重开。
+内存课堂恢复或重开。如果该课堂的课后产物后台任务仍在运行，后端会取消该
+任务并阻止它继续写文件；即使底层线程稍后返回，也不会把已删除的课堂目录
+重新创建出来。
 
 响应：
 
@@ -267,11 +272,25 @@ Content-Type: application/json
 2. 读取知识图谱。
 3. 将 session 状态改为 `ended`。
 4. 先保存核心本地文件，包括 `structured_notes.md`（如果录制中收到过结构化笔记）。
-5. 通过 WebSocket 广播 `session.ended`，其中包含保存路径和 `post_class_status: "generating"`。
-6. 立刻返回结束后的 `LectureSession`，不等待 summary / todos / RAG 索引。
-7. 后台任务运行最终内部 LLM 知识抽取、生成 `summary.md` / `todos.json`，
-   并在启用 LlamaIndex 时构建单节课 RAG 索引。
-8. 后台任务完成后广播 `post_class.updated`，前端再切换课后产物状态。
+5. 写入 `post_class_status.json`，状态为 `generating`。
+6. 通过 WebSocket 广播 `session.ended`，其中包含保存路径和 `post_class_status: "generating"`。
+7. 立刻返回结束后的 `LectureSession`，不等待 Qwen final notes、summary /
+   todos、final graph 或 RAG 索引。
+8. 后台任务先等待或调用本地 Qwen 生成 final `structured_notes.md`；完成后
+   广播 `post_class.updated`，`post_class_stage="notes_ready"`。
+9. 随后 summary/todos/title/RAG artifacts 和 final notes graph update 分别
+   作为独立后台阶段运行；谁完成就先广播对应的 `post_class.updated`。
+10. `post_class_status` 只描述课后产物阶段；`knowledge_graph_status` 单独描述
+   最终图谱阶段。只有 final notes graph update 成功后，
+   `knowledge_graph_status` 才会变成 `"final"`。
+11. 单节课 RAG 索引只有在 `RAG_QUERY_BACKEND=llamaindex` 且
+   `POST_CLASS_BUILD_RAG_INDEX=1` 时自动构建。
+
+如果程序在 `session.ended` 后、`post_class.updated` 前关闭，核心课堂文件已经
+保存，但进程内后台任务会丢失。重启后读取该历史课堂时，后端会发现
+`post_class_status.json` 仍为 `generating` 且当前进程没有对应任务，于是把
+状态标记为 `failed`，避免前端永久显示“生成中”。当前版本不会自动恢复这类
+中断任务。
 
 响应状态码：`200 OK`
 
@@ -428,10 +447,11 @@ scripts/dev.sh rebuild-global-index --llamaindex
 这是 WhisperLive/Qwen 本地笔记链路对接云端知识树 Agent 的入口：
 
 ```text
-WhisperLive 字幕草稿 -> 本地 Qwen structured_notes.md
+WhisperLive 字幕草稿 -> 本地 Qwen streaming structured_notes.md
 -> POST /agent/knowledge-tree/update-from-notes
 -> 云端 LLM 生成 KnowledgeExtraction
 -> 复用 knowledge.extraction 事件管线更新图谱和前端
+-> 结束课堂后，后端后台调用本地 Qwen 生成 final structured_notes.md
 -> final 快照可同时返回 session_title/course 并广播 session.updated
 ```
 
@@ -1081,6 +1101,7 @@ LLM_MAX_RETRIES
         "knowledge_graph": "data/sessions/lec_20260605_010203_ab12cd34/knowledge_graph.json"
       },
       "post_class_files": {},
+      "post_class_status_file": "data/sessions/lec_20260605_010203_ab12cd34/post_class_status.json",
       "rag_index": {
         "enabled": false,
         "status": "pending"
@@ -1089,7 +1110,8 @@ LLM_MAX_RETRIES
         "session_id": "lec_20260605_010203_ab12cd34",
         "status": "pending"
       },
-      "post_class_status": "generating"
+      "post_class_status": "generating",
+      "knowledge_graph_status": "finalizing"
     }
   },
   "created_at": "2026-06-05T01:02:03.000000+00:00"
@@ -1098,7 +1120,18 @@ LLM_MAX_RETRIES
 
 ### post_class.updated
 
-`POST /sessions/{session_id}/end` 返回后，后端后台任务生成课后产物、最终知识抽取和可选 RAG 索引。完成或失败时广播：
+`POST /sessions/{session_id}/end` 返回后，后端后台任务分阶段广播
+`post_class.updated`。常见阶段：
+
+| `post_class_stage` | 含义 |
+| --- | --- |
+| `notes_ready` | 本地 Qwen final 结构化笔记已经写入 `structured_notes.md` |
+| `artifacts_ready` | `summary.md`、`todos.json`、课堂命名和可选 RAG 索引阶段完成 |
+| `graph_ready` | final notes graph update 完成；成功时 `knowledge_graph_status="final"` |
+| `done` | 已收到后台阶段的最终汇总状态 |
+| `failed` | 后台任务整体异常 |
+
+单节课 RAG 索引只有在 `POST_CLASS_BUILD_RAG_INDEX=1` 时自动构建。示例：
 
 ```json
 {
@@ -1106,6 +1139,21 @@ LLM_MAX_RETRIES
   "session_id": "lec_20260605_010203_ab12cd34",
   "data": {
     "status": "ready",
+    "post_class_stage": "artifacts_ready",
+    "knowledge_graph_status": "finalizing",
+    "post_class_steps": {
+      "final_notes": {
+        "status": "ready",
+        "elapsed_seconds": 18.2
+      },
+      "artifacts": {
+        "status": "ready",
+        "elapsed_seconds": 11.4
+      },
+      "final_graph": {
+        "status": "running"
+      }
+    },
     "post_class_artifacts": {
       "summary_markdown": "本节课主要讲解……",
       "todos": [],
@@ -1114,6 +1162,10 @@ LLM_MAX_RETRIES
       "agent_messages": []
     },
     "storage": {
+      "final_structured_notes": {
+        "status": "ready",
+        "elapsed_seconds": 18.2
+      },
       "post_class_files": {
         "summary": "data/sessions/lec_20260605_010203_ab12cd34/summary.md",
         "todos": "data/sessions/lec_20260605_010203_ab12cd34/todos.json"
@@ -1121,13 +1173,6 @@ LLM_MAX_RETRIES
       "rag_index": {
         "enabled": false,
         "status": "skipped"
-      },
-      "knowledge_extraction": {
-        "session_id": "lec_20260605_010203_ab12cd34",
-        "provider": "llm",
-        "extraction_count": 1,
-        "processed_source_ids": ["seg_001", "seg_002"],
-        "errors": []
       }
     },
     "warnings": []
@@ -1136,7 +1181,12 @@ LLM_MAX_RETRIES
 }
 ```
 
-失败时 `data.status` 为 `"failed"`，`warnings` 会包含失败原因；课堂核心文件已经在 `session.ended` 前保存。
+`graph_ready` 消息会在 `storage.final_graph` 中包含 notes-agent 图谱更新结果；
+如果 final graph 失败，`knowledge_graph_status` 为 `"failed"`，但已经完成的
+summary/todos 仍然可以展示。失败时 `data.status` 为 `"failed"`，`warnings`
+会包含失败原因；课堂核心文件已经在 `session.ended` 前保存。
+后台任务成功、失败或被中断后，历史详情 API 都会通过 `post_class_status`
+和 `knowledge_graph_status` 返回当前状态。
 
 ## 8. 知识图谱数据
 
@@ -1197,6 +1247,7 @@ data/sessions/{session_id}/transcript.md
 data/sessions/{session_id}/structured_notes.md
 data/sessions/{session_id}/timeline.json
 data/sessions/{session_id}/knowledge_graph.json
+data/sessions/{session_id}/post_class_status.json
 data/sessions/{session_id}/summary.md
 data/sessions/{session_id}/todos.json
 data/sessions/{session_id}/quiz.json
@@ -1214,6 +1265,7 @@ data/sessions/{session_id}/images/
 | `structured_notes.md` | WhisperLive/Qwen 链路实时维护的结构化课堂笔记，可能不存在 |
 | `timeline.json` | `TimelineItem[]` |
 | `knowledge_graph.json` | `KnowledgeTree` |
+| `post_class_status.json` | 课后后台生成状态、阶段、步骤耗时、warnings 和最终图谱状态 |
 | `summary.md` | 课后总结，结束课堂后由后台任务生成 |
 | `todos.json` | 课后待办候选，结束课堂后由后台任务生成 |
 | `quiz.json` | 用户主动通过 Agent 生成自测题后保存 |

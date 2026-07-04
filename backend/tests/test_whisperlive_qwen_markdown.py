@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,11 +8,17 @@ from backend.scripts.whisperlive_qwen_markdown import (
     BackendSyncer,
     MarkdownResult,
     PeriodicMarkdownUpdater,
+    QwenDebugLogger,
+    QwenMarkdownPolisher,
     WhisperLiveSegment,
     build_markdown_prompt,
     enforce_markdown_grounding,
+    expanded_qwen_json_token_budget,
     fallback_markdown_result,
+    finalize_session_notes,
+    has_structured_markdown_content,
     is_useful_asr_text,
+    load_session_transcript_segments,
     make_markdown_output_path,
     is_subsumed_partial,
     normalize_collected_segments,
@@ -19,13 +26,14 @@ from backend.scripts.whisperlive_qwen_markdown import (
     normalize_whisper_language,
     parse_domain_terms,
     parse_whisperlive_segments,
+    qwen_debug_log_path,
     render_markdown,
     whisperlive_segment_id,
 )
 
 
 class FakeMarkdownPolisher:
-    def __init__(self) -> None:
+    def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
         self.calls: list[list[WhisperLiveSegment]] = []
 
     def generate(
@@ -41,6 +49,49 @@ class FakeMarkdownPolisher:
             sections=[("课堂重点", [segment.text for segment in segments])],
             keywords=domain_terms,
         )
+
+
+class EmptyMarkdownPolisher:
+    def generate(
+        self,
+        segments: list[WhisperLiveSegment],
+        *,
+        max_new_tokens: int,
+        domain_terms: list[str],
+    ) -> MarkdownResult:
+        return MarkdownResult(summary=[], sections=[], keywords=[])
+
+
+class FailingOnceMarkdownPolisher:
+    def __init__(self) -> None:
+        self.calls: list[list[WhisperLiveSegment]] = []
+
+    def generate(
+        self,
+        segments: list[WhisperLiveSegment],
+        *,
+        max_new_tokens: int,
+        domain_terms: list[str],
+    ) -> MarkdownResult:
+        self.calls.append(list(segments))
+        if len(self.calls) == 1:
+            raise RuntimeError("temporary qwen failure")
+        return MarkdownResult(
+            summary=["HTTP uses request and response messages."],
+            sections=[("HTTP", ["HTTP uses request and response messages."])],
+            keywords=["HTTP"],
+        )
+
+
+class KeywordOnlyMarkdownPolisher:
+    def generate(
+        self,
+        segments: list[WhisperLiveSegment],
+        *,
+        max_new_tokens: int,
+        domain_terms: list[str],
+    ) -> MarkdownResult:
+        return MarkdownResult(summary=[], sections=[], keywords=["HTTP"])
 
 
 class WhisperLiveQwenMarkdownTest(unittest.TestCase):
@@ -237,6 +288,125 @@ class WhisperLiveQwenMarkdownTest(unittest.TestCase):
         self.assertEqual(result.sections, [])
         self.assertEqual(result.keywords, [])
 
+    def test_keywords_only_result_is_not_structured_notes(self) -> None:
+        self.assertFalse(
+            has_structured_markdown_content(
+                MarkdownResult(summary=[], sections=[], keywords=["HTTP"])
+            )
+        )
+        self.assertTrue(
+            has_structured_markdown_content(
+                MarkdownResult(summary=["HTTP overview"], sections=[], keywords=["HTTP"])
+            )
+        )
+
+    def test_qwen_markdown_polisher_retries_keywords_only_output(self) -> None:
+        class FakePipe:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def generate(self, prompt: str, **_kwargs):  # type: ignore[no-untyped-def]
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    return '{"summary":[],"sections":[],"keywords":["HTTP"]}'
+                return (
+                    '{"summary":["HTTP uses request and response messages."],'
+                    '"sections":[{"heading":"HTTP","bullets":["HTTP uses request and response messages."]}],'
+                    '"keywords":["HTTP"]}'
+                )
+
+        polisher = object.__new__(QwenMarkdownPolisher)
+        polisher.pipe = FakePipe()
+        result = polisher.generate(
+            [WhisperLiveSegment(0.0, 2.0, "HTTP uses request and response messages.", True)],
+            max_new_tokens=128,
+            domain_terms=[],
+        )
+
+        self.assertEqual(result.summary, ["HTTP uses request and response messages."])
+        self.assertEqual(len(polisher.pipe.prompts), 2)
+
+    def test_qwen_markdown_polisher_retries_truncated_json_with_larger_budget(self) -> None:
+        class FakePipe:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def generate(self, prompt: str, **kwargs):  # type: ignore[no-untyped-def]
+                self.calls.append({"prompt": prompt, **kwargs})
+                if len(self.calls) <= 2:
+                    return '{"summary":["HTTP uses request'
+                return (
+                    '{"summary":["HTTP uses request and response messages."],'
+                    '"sections":[{"heading":"HTTP","bullets":["HTTP uses request and response messages."]}],'
+                    '"keywords":["HTTP"]}'
+                )
+
+        polisher = object.__new__(QwenMarkdownPolisher)
+        polisher.pipe = FakePipe()
+        result = polisher.generate(
+            [WhisperLiveSegment(0.0, 2.0, "HTTP uses request and response messages.", True)],
+            max_new_tokens=128,
+            domain_terms=[],
+        )
+
+        self.assertEqual(result.summary, ["HTTP uses request and response messages."])
+        self.assertEqual(polisher.pipe.calls[0]["max_new_tokens"], 128)
+        self.assertEqual(
+            polisher.pipe.calls[1]["max_new_tokens"],
+            expanded_qwen_json_token_budget(128),
+        )
+        self.assertEqual(
+            polisher.pipe.calls[2]["max_new_tokens"],
+            expanded_qwen_json_token_budget(128),
+        )
+
+    def test_qwen_debug_logger_records_generation_details(self) -> None:
+        class FakePipe:
+            def generate(self, _prompt: str, **_kwargs):  # type: ignore[no-untyped-def]
+                return (
+                    '{"summary":[{"text":"Email uses SMTP.",'
+                    f'"source_segment_ids":["{segment_id}"]}}],'
+                    '"sections":[{"heading":"Email","bullets":[{"text":"SMTP transfers mail.",'
+                    f'"source_segment_ids":["{segment_id}"]}}]}}],'
+                    '"keywords":["SMTP"]}'
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segment = WhisperLiveSegment(0.0, 2.0, "Email uses SMTP to transfer mail.", True)
+            segment_id = whisperlive_segment_id(segment)
+            output_path = Path(tmpdir) / "structured_notes.md"
+            debug_logger = QwenDebugLogger(qwen_debug_log_path(output_path))
+            polisher = object.__new__(QwenMarkdownPolisher)
+            polisher.pipe = FakePipe()
+            polisher.debug_logger = debug_logger
+            polisher._generation_count = 0
+
+            result = polisher.generate(
+                [segment],
+                max_new_tokens=128,
+                domain_terms=[],
+            )
+
+            self.assertEqual(result.summary, ["Email uses SMTP."])
+            log_path = qwen_debug_log_path(output_path)
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            events = [record["event"] for record in records]
+            self.assertIn("generate_start", events)
+            self.assertIn("pipe_generate_done", events)
+            self.assertIn("parse_success", events)
+            self.assertIn("grounding_result", events)
+            self.assertIn("generate_success", events)
+            self.assertTrue(
+                any(
+                    "Email uses SMTP" in str(record)
+                    for record in records
+                    if record["event"] == "pipe_generate_done"
+                )
+            )
+
     def test_normalize_markdown_result_uses_transcript_fallbacks(self) -> None:
         source_segments = [
             WhisperLiveSegment(0.0, 1.0, "同学们好", True),
@@ -281,6 +451,152 @@ class WhisperLiveQwenMarkdownTest(unittest.TestCase):
         self.assertEqual(result.summary, ["文化渗透"])
         self.assertEqual(result.sections, [("文化渗透", ["在中国传教"])])
         self.assertEqual(result.keywords, ["文化渗透"])
+
+    def test_enforce_markdown_grounding_accepts_source_backed_paraphrase(self) -> None:
+        segments = [
+            WhisperLiveSegment(
+                0.0,
+                5.0,
+                "Email has three components.",
+                True,
+            ),
+            WhisperLiveSegment(
+                5.0,
+                10.0,
+                "First, there is the user agent or mail client.",
+                True,
+            ),
+            WhisperLiveSegment(
+                10.0,
+                15.0,
+                "Then there are email servers and the SMTP protocol.",
+                True,
+            ),
+        ]
+        source_ids = [whisperlive_segment_id(segment) for segment in segments]
+
+        result = enforce_markdown_grounding(
+            normalize_markdown_result(
+                {
+                    "summary": [
+                        {
+                            "text": (
+                                "Email has three core components: user agents, "
+                                "email servers, and SMTP."
+                            ),
+                            "source_segment_ids": source_ids,
+                        },
+                        {
+                            "text": "Email relies on quantum encryption hardware.",
+                            "source_segment_ids": [source_ids[0]],
+                        },
+                    ],
+                    "sections": [
+                        {
+                            "heading": "Email infrastructure",
+                            "bullets": [
+                                {
+                                    "text": (
+                                        "The user agent is the mail client used by "
+                                        "the end user."
+                                    ),
+                                    "source_segment_ids": [source_ids[1]],
+                                }
+                            ],
+                        }
+                    ],
+                    "keywords": ["Email", "SMTP"],
+                },
+                segments,
+            ),
+            segments=segments,
+            domain_terms=[],
+        )
+
+        self.assertEqual(
+            result.summary,
+            ["Email has three core components: user agents, email servers, and SMTP."],
+        )
+        self.assertEqual(
+            result.sections,
+            [
+                (
+                    "Email infrastructure",
+                    ["The user agent is the mail client used by the end user."],
+                )
+            ],
+        )
+        self.assertEqual(result.keywords, ["Email", "SMTP"])
+
+    def test_enforce_markdown_grounding_allows_source_backed_conceptual_notes(self) -> None:
+        segments = [
+            WhisperLiveSegment(
+                0.0,
+                5.0,
+                "Dynamic Adaptive Streaming over HTTP, or DASH, adapts to changes in bandwidth.",
+                True,
+            ),
+            WhisperLiveSegment(
+                5.0,
+                10.0,
+                "The system must support scale, mobile users, fixed users, and broadband users.",
+                True,
+            ),
+        ]
+        source_ids = [whisperlive_segment_id(segment) for segment in segments]
+
+        result = enforce_markdown_grounding(
+            normalize_markdown_result(
+                {
+                    "summary": [
+                        {
+                            "text": "DASH handles bandwidth adaptation in video delivery.",
+                            "source_segment_ids": [source_ids[0]],
+                        },
+                        {
+                            "text": "Streaming infrastructure must handle scale and user heterogeneity.",
+                            "source_segment_ids": [source_ids[1]],
+                        },
+                        {
+                            "text": "DASH requires quantum encryption hardware.",
+                            "source_segment_ids": [source_ids[0]],
+                        },
+                    ],
+                    "sections": [
+                        {
+                            "heading": "Streaming challenges",
+                            "bullets": [
+                                {
+                                    "text": "Scale and heterogeneous users shape streaming infrastructure.",
+                                    "source_segment_ids": [source_ids[1]],
+                                }
+                            ],
+                        }
+                    ],
+                    "keywords": ["DASH", "bandwidth", "heterogeneity"],
+                },
+                segments,
+            ),
+            segments=segments,
+            domain_terms=[],
+        )
+
+        self.assertEqual(
+            result.summary,
+            [
+                "DASH handles bandwidth adaptation in video delivery.",
+                "Streaming infrastructure must handle scale and user heterogeneity.",
+            ],
+        )
+        self.assertEqual(
+            result.sections,
+            [
+                (
+                    "Streaming challenges",
+                    ["Scale and heterogeneous users shape streaming infrastructure."],
+                )
+            ],
+        )
 
     def test_render_markdown_includes_notes_and_raw_transcripts(self) -> None:
         segments = [WhisperLiveSegment(0.0, 2.0, "原始字幕", True)]
@@ -360,6 +676,241 @@ class WhisperLiveQwenMarkdownTest(unittest.TestCase):
             self.assertIn("更新状态：final", markdown)
             self.assertIn("最终句", markdown)
             self.assertEqual(len(fake_qwen.calls), 2)
+
+    def test_periodic_markdown_updater_rejects_empty_qwen_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "lecture.wav"
+            input_path.write_bytes(b"")
+            output_path = make_markdown_output_path(Path(tmpdir), input_path)
+            updater = PeriodicMarkdownUpdater(
+                qwen_factory=EmptyMarkdownPolisher,
+                snapshot_segments=lambda: [],
+                output_path=output_path,
+                input_path=input_path,
+                whisper_model="OpenVINO/whisper-large-v3-turbo-fp16-ov",
+                domain_terms=[],
+                max_new_tokens=128,
+                update_every_seconds=0,
+                min_update_segments=1,
+            )
+
+            with self.assertRaises(RuntimeError):
+                updater.write_update(
+                    [
+                        WhisperLiveSegment(
+                            0.0,
+                            6.0,
+                            "HTTP caching reduces user perceived latency.",
+                            True,
+                        ),
+                    ],
+                    final=True,
+                )
+            self.assertFalse(output_path.exists())
+
+    def test_periodic_markdown_updater_retries_failed_batch_with_later_context(self) -> None:
+        fake_qwen = FailingOnceMarkdownPolisher()
+        segments = [
+            WhisperLiveSegment(
+                0.0,
+                2.0,
+                "HTTP uses request and response messages.",
+                True,
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "lecture.wav"
+            input_path.write_bytes(b"")
+            output_path = make_markdown_output_path(Path(tmpdir), input_path)
+            updater = PeriodicMarkdownUpdater(
+                qwen_factory=lambda: fake_qwen,
+                snapshot_segments=lambda: [],
+                output_path=output_path,
+                input_path=input_path,
+                whisper_model="OpenVINO/whisper-large-v3-turbo-fp16-ov",
+                domain_terms=[],
+                max_new_tokens=128,
+                update_every_seconds=0,
+                min_update_segments=1,
+            )
+
+            self.assertIsNone(updater.write_update(segments, final=False))
+            self.assertIsNone(updater.write_update(segments, final=False))
+            self.assertEqual(len(fake_qwen.calls), 1)
+
+            later_segments = [
+                *segments,
+                WhisperLiveSegment(
+                    2.0,
+                    4.0,
+                    "HTTP responses include status codes.",
+                    True,
+                ),
+            ]
+            written = updater.write_update(later_segments, final=False)
+
+            self.assertEqual(written, output_path)
+            self.assertEqual(len(fake_qwen.calls), 2)
+            self.assertEqual(
+                [segment.text for segment in fake_qwen.calls[1]],
+                [
+                    "HTTP uses request and response messages.",
+                    "HTTP responses include status codes.",
+                ],
+            )
+            self.assertIn(
+                "HTTP uses request and response messages.",
+                output_path.read_text(encoding="utf-8"),
+            )
+
+    def test_periodic_markdown_updater_processes_backlog_in_small_batches(self) -> None:
+        fake_qwen = FakeMarkdownPolisher()
+        segments = [
+            WhisperLiveSegment(float(index), float(index + 1), f"第 {index} 句", True)
+            for index in range(5)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "lecture.wav"
+            input_path.write_bytes(b"")
+            output_path = make_markdown_output_path(Path(tmpdir), input_path)
+            updater = PeriodicMarkdownUpdater(
+                qwen_factory=lambda: fake_qwen,
+                snapshot_segments=lambda: [],
+                output_path=output_path,
+                input_path=input_path,
+                whisper_model="OpenVINO/whisper-large-v3-turbo-fp16-ov",
+                domain_terms=[],
+                max_new_tokens=128,
+                update_every_seconds=0,
+                min_update_segments=1,
+                max_qwen_segments_per_update=2,
+            )
+
+            updater.write_update(segments, final=False)
+            updater.write_update(segments, final=False)
+            updater.write_update(segments, final=False)
+
+            self.assertEqual(
+                [[segment.text for segment in call] for call in fake_qwen.calls],
+                [["第 0 句", "第 1 句"], ["第 2 句", "第 3 句"], ["第 4 句"]],
+            )
+            markdown = output_path.read_text(encoding="utf-8")
+            self.assertIn("第 0 句", markdown)
+            self.assertIn("第 4 句", markdown)
+
+    def test_final_markdown_update_processes_all_pending_batches(self) -> None:
+        fake_qwen = FakeMarkdownPolisher()
+        segments = [
+            WhisperLiveSegment(float(index), float(index + 1), f"final {index}", True)
+            for index in range(5)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "lecture.wav"
+            input_path.write_bytes(b"")
+            output_path = make_markdown_output_path(Path(tmpdir), input_path)
+            updater = PeriodicMarkdownUpdater(
+                qwen_factory=lambda: fake_qwen,
+                snapshot_segments=lambda: [],
+                output_path=output_path,
+                input_path=input_path,
+                whisper_model="OpenVINO/whisper-large-v3-turbo-fp16-ov",
+                domain_terms=[],
+                max_new_tokens=128,
+                update_every_seconds=0,
+                min_update_segments=1,
+                max_qwen_segments_per_update=2,
+            )
+
+            updater.write_update(segments, final=True)
+
+            self.assertEqual(
+                [[segment.text for segment in call] for call in fake_qwen.calls],
+                [["final 0", "final 1"], ["final 2", "final 3"], ["final 4"]],
+            )
+            self.assertIn("更新状态：final", output_path.read_text(encoding="utf-8"))
+
+    def test_finalize_session_notes_reads_saved_timeline_and_writes_final_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir) / "lec_saved"
+            session_dir.mkdir()
+            (session_dir / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+            (session_dir / "timeline.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "type": "transcript",
+                            "ts": 0.0,
+                            "data": {
+                                "start_ts": 0.0,
+                                "end_ts": 2.0,
+                                "text": "HTTP uses request and response messages.",
+                                "is_final": True,
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "finalize_session_id": "lec_saved",
+                    "finalize_session_dir": str(session_dir),
+                    "sessions_dir": tmpdir,
+                    "domain_terms": "",
+                    "qwen_model": "/tmp/qwen",
+                    "qwen_device": "CPU",
+                    "qwen_tokens": 128,
+                    "whisperlive_model": "OpenVINO/whisper-large-v3-turbo-fp16-ov",
+                },
+            )()
+
+            with patch(
+                "backend.scripts.whisperlive_qwen_markdown.QwenMarkdownPolisher",
+                FakeMarkdownPolisher,
+            ):
+                output_path = finalize_session_notes(args)
+
+            markdown = output_path.read_text(encoding="utf-8")
+            self.assertIn("更新状态：final", markdown)
+            self.assertIn("HTTP uses request and response messages.", markdown)
+
+    def test_load_session_transcript_segments_uses_only_final_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            (session_dir / "timeline.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "type": "transcript",
+                            "ts": 0.0,
+                            "data": {
+                                "start_ts": 0.0,
+                                "end_ts": 1.0,
+                                "text": "final text",
+                                "is_final": True,
+                            },
+                        },
+                        {
+                            "type": "transcript",
+                            "ts": 1.0,
+                            "data": {
+                                "start_ts": 1.0,
+                                "end_ts": 2.0,
+                                "text": "preview text",
+                                "is_final": False,
+                            },
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            segments = load_session_transcript_segments(session_dir)
+
+        self.assertEqual([segment.text for segment in segments], ["final text"])
 
     def test_periodic_markdown_update_reports_recent_segments(self) -> None:
         fake_qwen = FakeMarkdownPolisher()

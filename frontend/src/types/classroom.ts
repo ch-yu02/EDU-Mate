@@ -22,6 +22,7 @@ export type LectureSession = {
 export type WebSocketStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export type PostClassStatus = "idle" | "generating" | "ready" | "failed";
+export type KnowledgeGraphStatus = "live" | "finalizing" | "final" | "failed";
 
 // ASR 字幕片段，对应 event_type = "transcript.segment"。
 export type TranscriptSegment = {
@@ -149,6 +150,12 @@ export type SessionHistoryDetail = {
   storage_path: string;
   // 课后产物。结束课堂时后端会自动生成；旧历史课堂可能为空。
   post_class_artifacts?: SessionPostClassArtifacts;
+  // 课后产物后台生成状态。旧历史课堂可能没有该字段，前端按 ready 兼容。
+  post_class_status?: PostClassStatus;
+  // 课后产物生成过程中的失败原因或提示。
+  post_class_warnings?: string[];
+  // 知识图谱最终化状态。final 表示最终全量图谱抽取已经完成。
+  knowledge_graph_status?: KnowledgeGraphStatus;
 };
 
 // 历史课堂目录中的课后产物。
@@ -220,6 +227,7 @@ export type ClassroomDashboardState = {
   timeline: TimelineItem[];
   visuals: ImageCapture[];
   graph: KnowledgeGraphView;
+  knowledgeGraphStatus: KnowledgeGraphStatus;
   postClassStatus: PostClassStatus;
   postClassArtifacts: SessionPostClassArtifacts;
 };
