@@ -13,6 +13,21 @@ class CloudLLMClientTest(unittest.TestCase):
         self.assertEqual(settings.provider, "deepseek")
         self.assertEqual(settings.model, "deepseek-v4-flash")
         self.assertEqual(settings.base_url, "https://api.deepseek.com")
+        self.assertTrue(settings.ignore_proxy)
+
+    def test_settings_can_allow_system_proxy(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_PROVIDER": "deepseek",
+                "LLM_API_KEY": "test-key",
+                "LLM_IGNORE_PROXY": "0",
+            },
+            clear=True,
+        ):
+            settings = load_llm_settings()
+
+        self.assertFalse(settings.ignore_proxy)
 
     def test_local_provider_is_enabled_without_api_key(self) -> None:
         with patch.dict(
@@ -86,21 +101,54 @@ class CloudLLMClientTest(unittest.TestCase):
                 base_url="http://127.0.0.1:11434/v1",
                 timeout_seconds=1,
                 max_retries=0,
+                ignore_proxy=True,
             )
         )
         captured_headers: dict[str, str] = {}
 
-        def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+        def fake_open(request, timeout):  # type: ignore[no-untyped-def]
             captured_headers.update(request.headers)
             return _FakeHttpResponse(
                 b'{"choices":[{"message":{"content":"local ok"}}]}'
             )
 
-        with patch("urllib.request.urlopen", fake_urlopen):
-            response = client.complete("system", "user")
+        client._opener = _FakeOpener(fake_open)  # type: ignore[assignment]
+        response = client.complete("system", "user")
 
         self.assertEqual(response.content, "local ok")
         self.assertNotIn("Authorization", captured_headers)
+
+    def test_client_ignores_proxy_by_default(self) -> None:
+        with patch(
+            "urllib.request.ProxyHandler",
+            return_value="no-proxy-handler",
+        ) as proxy_handler, patch(
+            "urllib.request.build_opener",
+            return_value=_FakeOpener(lambda request, timeout: _FakeHttpResponse(b"{}")),
+        ) as build_opener:
+            CloudLLMClient(self._settings())
+
+        proxy_handler.assert_called_once_with({})
+        build_opener.assert_called_once_with("no-proxy-handler")
+
+    def test_client_can_use_default_proxy_opener(self) -> None:
+        settings = LLMSettings(
+            provider="fake",
+            api_key="test-key",
+            model="fake-model",
+            base_url="https://example.invalid/v1",
+            timeout_seconds=1,
+            max_retries=0,
+            ignore_proxy=False,
+        )
+
+        with patch(
+            "urllib.request.build_opener",
+            return_value=_FakeOpener(lambda request, timeout: _FakeHttpResponse(b"{}")),
+        ) as build_opener:
+            CloudLLMClient(settings)
+
+        build_opener.assert_called_once_with()
 
     def test_kimi_provider_forces_temperature_to_one(self) -> None:
         client = CloudLLMClient(
@@ -111,6 +159,7 @@ class CloudLLMClientTest(unittest.TestCase):
                 base_url="https://api.moonshot.cn/v1",
                 timeout_seconds=1,
                 max_retries=0,
+                ignore_proxy=True,
             )
         )
         captured_payload: dict[str, object] = {}
@@ -145,7 +194,13 @@ class CloudLLMClientTest(unittest.TestCase):
             base_url="https://example.invalid/v1",
             timeout_seconds=1,
             max_retries=0,
+            ignore_proxy=True,
         )
+
+
+class _FakeOpener:
+    def __init__(self, open_impl) -> None:  # type: ignore[no-untyped-def]
+        self.open = open_impl
 
 
 class _FakeHttpResponse:

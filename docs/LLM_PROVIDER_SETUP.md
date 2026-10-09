@@ -29,6 +29,7 @@ LLM_MODEL=deepseek-v4-flash
 LLM_BASE_URL=https://api.deepseek.com
 LLM_TIMEOUT_SECONDS=30
 LLM_MAX_RETRIES=1
+LLM_IGNORE_PROXY=1
 NO_PROXY=localhost,127.0.0.1
 no_proxy=localhost,127.0.0.1
 ```
@@ -65,11 +66,12 @@ For image analysis, the configured model must support OpenAI-compatible
 multimodal chat content. A text-only model can still power QA and graph
 extraction, but `/agent/visual/analyze` will fail with a warning.
 
-If the device uses a system proxy, leave proxy routing to the system or shell
-environment unless a provider explicitly requires bypassing it. The project
-defaults only exclude local backend/frontend addresses in `NO_PROXY` /
-`no_proxy`; adding cloud API hosts is a local deployment choice, not a project
-default.
+Cloud LLM requests default to direct connections and ignore inherited
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` variables. This avoids failures when
+a desktop proxy app is closed but the EDU-Mate process still inherits stale
+proxy ports. Set `LLM_IGNORE_PROXY=0` only when your cloud provider must be
+accessed through the system proxy. `NO_PROXY` / `no_proxy` are still kept for
+local backend/frontend addresses.
 
 Image analysis has an extra retry-friendly timeout behavior: the first request
 uses `LLM_TIMEOUT_SECONDS`; if the same image fails and the recording frontend

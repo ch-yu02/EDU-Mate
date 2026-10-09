@@ -1072,6 +1072,7 @@ LLM_MODEL
 LLM_BASE_URL
 LLM_TIMEOUT_SECONDS
 LLM_MAX_RETRIES
+LLM_IGNORE_PROXY
 ```
 
 如果 LLM 未配置、调用失败或返回内容无法校验为 `KnowledgeExtraction`，

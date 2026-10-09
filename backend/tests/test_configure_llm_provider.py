@@ -31,6 +31,7 @@ class ConfigureLLMProviderTest(unittest.TestCase):
                     "LLM_BASE_URL": "https://api.moonshot.cn/v1",
                     "LLM_TIMEOUT_SECONDS": "60",
                     "LLM_MAX_RETRIES": "1",
+                    "LLM_IGNORE_PROXY": "1",
                 },
             )
 
@@ -40,6 +41,7 @@ class ConfigureLLMProviderTest(unittest.TestCase):
         self.assertIn("EXISTING=yes", content)
         self.assertIn("# keep this comment", content)
         self.assertIn("LLM_PROVIDER=kimi", content)
+        self.assertIn("LLM_IGNORE_PROXY=1", content)
         self.assertEqual(values["LLM_API_KEY"], "sk key#1")
         self.assertEqual(values["LLM_BASE_URL"], "https://api.moonshot.cn/v1")
 
@@ -56,6 +58,7 @@ class ConfigureLLMProviderTest(unittest.TestCase):
         self.assertEqual(updates["LLM_PROVIDER"], "local")
         self.assertEqual(updates["LLM_API_KEY"], "")
         self.assertEqual(updates["LLM_MODEL"], "llama3.1")
+        self.assertEqual(updates["LLM_IGNORE_PROXY"], "1")
 
     def test_noninteractive_cloud_provider_requires_api_key(self) -> None:
         with self.assertRaises(ValueError):

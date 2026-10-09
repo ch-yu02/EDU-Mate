@@ -43,6 +43,12 @@ class CloudLLMClient:
         if not settings.enabled:
             raise CloudLLMError("LLM_API_KEY is not configured")
         self.settings = settings
+        if settings.ignore_proxy:
+            # urllib 默认会读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。设备上代理
+            # 软件退出后这些变量可能仍然存在，导致云端 LLM 请求走向失效端口。
+            self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        else:
+            self._opener = urllib.request.build_opener()
 
     def complete(
         self,
@@ -174,7 +180,7 @@ class CloudLLMClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(  # noqa: S310 - URL 来自后端受控配置。
+            with self._opener.open(  # noqa: S310 - URL 来自后端受控配置。
                 request,
                 timeout=self.settings.timeout_seconds,
             ) as response:

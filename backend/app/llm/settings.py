@@ -24,6 +24,8 @@ class LLMSettings:
     """单次请求超时时间。"""
     max_retries: int
     """失败后的重试次数。0 表示不重试。"""
+    ignore_proxy: bool
+    """是否忽略系统代理环境变量，直接请求 LLM API。"""
 
     @property
     def enabled(self) -> bool:
@@ -48,6 +50,7 @@ def load_llm_settings() -> LLMSettings:
     - ``LLM_BASE_URL``：为空时按 provider 选择 OpenAI-compatible 地址。
     - ``LLM_TIMEOUT_SECONDS``：默认 30。
     - ``LLM_MAX_RETRIES``：默认 1。
+    - ``LLM_IGNORE_PROXY``：默认 1，表示云端 LLM 请求不走系统代理。
     """
     provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower() or "deepseek"
     api_key = os.getenv("LLM_API_KEY") or None
@@ -55,6 +58,7 @@ def load_llm_settings() -> LLMSettings:
     base_url = os.getenv("LLM_BASE_URL") or _default_base_url(provider)
     timeout_seconds = _float_env("LLM_TIMEOUT_SECONDS", 30.0)
     max_retries = _int_env("LLM_MAX_RETRIES", 1)
+    ignore_proxy = _bool_env("LLM_IGNORE_PROXY", True)
 
     return LLMSettings(
         provider=provider,
@@ -63,6 +67,7 @@ def load_llm_settings() -> LLMSettings:
         base_url=base_url.rstrip("/"),
         timeout_seconds=timeout_seconds,
         max_retries=max(0, max_retries),
+        ignore_proxy=ignore_proxy,
     )
 
 
@@ -106,3 +111,16 @@ def _int_env(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """读取 bool 环境变量，支持常见真假值写法。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default

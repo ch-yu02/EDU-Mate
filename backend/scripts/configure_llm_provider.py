@@ -26,6 +26,7 @@ LLM_KEYS = (
     "LLM_BASE_URL",
     "LLM_TIMEOUT_SECONDS",
     "LLM_MAX_RETRIES",
+    "LLM_IGNORE_PROXY",
 )
 
 NO_PROXY_VALUE = "localhost,127.0.0.1"
@@ -313,6 +314,7 @@ def _settings_updates(
         "LLM_BASE_URL": base_url.strip().rstrip("/"),
         "LLM_TIMEOUT_SECONDS": "60",
         "LLM_MAX_RETRIES": "1",
+        "LLM_IGNORE_PROXY": "1",
         "NO_PROXY": NO_PROXY_VALUE,
         "no_proxy": NO_PROXY_VALUE,
     }
