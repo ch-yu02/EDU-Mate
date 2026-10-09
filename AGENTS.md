@@ -1,7 +1,10 @@
 # EDU-Mate Development Guide
 
-This file is the compact project guide. Keep detailed API contracts in `docs/`
-and active roadmap items in `Tasks.md`.
+This file is the developer guide. Start at `README.md` for the public project
+overview and document publication policy. Keep deployment steps in
+`docs/DEPLOYMENT_GUIDE.md`, detailed API contracts in `docs/API_SCHEMA.md`,
+and public packaging limitations in the deployment guide. `Tasks.md` is an
+optional local checklist, ignored by Git and absent from a fresh clone.
 
 ## Current Shape
 
@@ -100,8 +103,8 @@ with `force=true` and the backend can extend timeout based on prior failures.
 History and Agent:
 
 ```text
-POST /sessions/{session_id}/end
--> frontend finalizes the current preview subtitle if one is visible
+frontend finalizes the current preview subtitle if one is visible
+-> POST /sessions/{session_id}/end
 -> data/sessions/{session_id}/...
 -> session.ended returns quickly with post_class_status=generating
 -> background local Qwen final structured notes
@@ -273,7 +276,9 @@ scripts/dev.sh whisperlive-md --enable-cloud-graph --max-audio-seconds 300
 ## Documentation Map
 
 - `AGENTS.md`: compact project guide.
-- `Tasks.md`: active roadmap and checklist.
+- `Tasks.md`: optional local roadmap, not distributed with the repository.
+- `README.md`: public project entry and document publication policy.
+- `docs/DEPLOYMENT_GUIDE.md`: human-readable project overview and new-device deployment guide.
 - `docs/API_SCHEMA.md`: HTTP/WebSocket/Agent API schema and ASR/camera/hardware input contract.
 - `docs/LLM_PROVIDER_SETUP.md`: Kimi/DeepSeek/OpenAI/local provider setup.
-- `docs/PACKAGING_PLAN.md`: app launcher, desktop shortcut, and packaging plan.
+- Packaging status and public follow-up directions live in the deployment guide.

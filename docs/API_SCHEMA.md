@@ -3,6 +3,9 @@
 本文档描述当前后端接口契约，供前端、算法模块、硬件采集模块和
 mock sender 联调使用。
 
+首次部署见 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)，供应商和检索配置见
+[LLM_PROVIDER_SETUP.md](LLM_PROVIDER_SETUP.md)。本文仅描述当前接口和脚本行为。
+
 当前后端职责：
 
 1. 创建课堂 session。
@@ -26,7 +29,7 @@ http://127.0.0.1:8000
 ws://127.0.0.1:8000/ws/{session_id}
 ```
 
-HTTP 请求统一使用 JSON：
+除图片上传使用原始图片二进制外，结构化 HTTP 请求使用 JSON：
 
 ```http
 Content-Type: application/json
@@ -58,7 +61,7 @@ Content-Type: application/json
 
 ### GET /health
 
-健康检查。
+后端存活检查，不检测麦克风、摄像头、WhisperLive、Qwen 或云端模型是否就绪。
 
 响应示例：
 
@@ -119,9 +122,9 @@ Content-Type: application/json
 
 ### PATCH /sessions/{session_id}
 
-更新课堂标题和课程名称。用于前端手动改名，也用于 WhisperLive/Qwen 最终笔记
-生成后由云端 notes-agent 把推断出的课堂名称同步到后端。本地 Qwen 只负责
-结构化笔记，不负责最终课堂命名。
+更新课堂标题和课程名称，供前端手动改名使用。自动命名通过后端最终笔记
+图谱更新和课后产物流程在内部更新元信息，不要求客户端另行调用本接口。
+本地 Qwen 只负责结构化笔记，不负责最终课堂命名。
 
 请求体：
 
@@ -442,7 +445,9 @@ scripts/dev.sh rebuild-global-index --llamaindex
 
 ### POST /agent/knowledge-tree/update-from-notes
 
-用结构化 Markdown 课堂笔记更新录制中课堂的知识图谱。
+用结构化 Markdown 课堂笔记更新知识图谱。`streaming` 仅接受录制中的课堂；
+`final` 也接受已结束但 session、上下文和图谱仍在当前进程内的课堂。
+后端重启后只剩磁盘历史文件时，该接口不会自动恢复上下文，返回 `404`。
 
 这是 WhisperLive/Qwen 本地笔记链路对接云端知识树 Agent 的入口：
 
@@ -488,7 +493,7 @@ WhisperLive 字幕草稿 -> 本地 Qwen streaming structured_notes.md
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `session_id` | string | 是 | 必须是录制中课堂 |
+| `session_id` | string | 是 | 必须存在于当前进程中；已结束课堂只接受 `final` |
 | `snapshot_id` | string | 是 | 本次笔记快照 ID |
 | `sequence` | number | 否 | 快照序号，用于日志和排查乱序 |
 | `markdown` | string | 是 | 当前完整结构化课堂笔记 |
@@ -501,6 +506,11 @@ WhisperLive 字幕草稿 -> 本地 Qwen streaming structured_notes.md
 
 - `streaming` 快照主要用于增量图谱更新。
 - `final` 快照可同时让云端 notes-agent 根据课堂内容生成短标题和课程名。
+- 发给云端的 Markdown 会去掉 `WhisperLive Subtitles` 原始字幕附录，
+  本地保存的笔记仍保留该部分。后端最终图谱任务还会选择相关字幕作为来源，
+  不再一次性发送整节课的全部字幕。
+- 请求中的 `update_status=final` 不等于最终图谱状态已经成功。课后流程
+  单独维护 `knowledge_graph_status`，客户端应读取该状态判断最终更新结果。
 - 本地 Qwen 不再润色或替换前端实时字幕；前端字幕显示 WhisperLive/ASR 原始
   `transcript.segment`。
 
@@ -1132,7 +1142,8 @@ LLM_IGNORE_PROXY
 | `done` | 已收到后台阶段的最终汇总状态 |
 | `failed` | 后台任务整体异常 |
 
-单节课 RAG 索引只有在 `POST_CLASS_BUILD_RAG_INDEX=1` 时自动构建。示例：
+单节课 RAG 索引只有在 `RAG_QUERY_BACKEND=llamaindex` 且
+`POST_CLASS_BUILD_RAG_INDEX=1` 时自动构建。示例：
 
 ```json
 {
@@ -1167,13 +1178,15 @@ LLM_IGNORE_PROXY
         "status": "ready",
         "elapsed_seconds": 18.2
       },
-      "post_class_files": {
-        "summary": "data/sessions/lec_20260605_010203_ab12cd34/summary.md",
-        "todos": "data/sessions/lec_20260605_010203_ab12cd34/todos.json"
-      },
-      "rag_index": {
-        "enabled": false,
-        "status": "skipped"
+      "artifacts": {
+        "post_class_files": {
+          "summary": "data/sessions/lec_20260605_010203_ab12cd34/summary.md",
+          "todos": "data/sessions/lec_20260605_010203_ab12cd34/todos.json"
+        },
+        "rag_index": {
+          "enabled": false,
+          "status": "skipped"
+        }
       }
     },
     "warnings": []
@@ -1184,15 +1197,17 @@ LLM_IGNORE_PROXY
 
 `graph_ready` 消息会在 `storage.final_graph` 中包含 notes-agent 图谱更新结果；
 如果 final graph 失败，`knowledge_graph_status` 为 `"failed"`，但已经完成的
-summary/todos 仍然可以展示。失败时 `data.status` 为 `"failed"`，`warnings`
-会包含失败原因；课堂核心文件已经在 `session.ended` 前保存。
+summary/todos 仍然可以展示。`data.status` 描述产物任务状态，图谱单独失败
+不一定使它变为 `"failed"`；应同时读取 `knowledge_graph_status` 和各步骤状态。
+`warnings` 包含失败原因；课堂核心文件已经在 `session.ended` 前保存。
 后台任务成功、失败或被中断后，历史详情 API 都会通过 `post_class_status`
 和 `knowledge_graph_status` 返回当前状态。
 
 ## 8. 知识图谱数据
 
-完整知识图谱 `KnowledgeTree` 会在结束课堂时保存为
-`knowledge_graph.json`。
+完整知识图谱 `KnowledgeTree` 会在结束课堂时保存为 `knowledge_graph.json`，
+后台最终更新完成后再次保存。`version` 始终是数字版本号，界面显示的
+`final` 来自独立的最终图谱状态，不是把 JSON 中的版本号改为字符串。
 
 ```json
 {
@@ -1240,7 +1255,8 @@ summary/todos 仍然可以展示。失败时 `data.status` 为 `"failed"`，`war
 
 ## 9. 本地保存文件
 
-结束课堂后，后端写入：
+课堂可能生成以下文件，并非所有文件都在结束接口返回时存在。
+图片和笔记可以在课堂中写入；总结、待办在后台生成；自测题按需生成：
 
 ```text
 data/sessions/{session_id}/metadata.json
@@ -1267,6 +1283,7 @@ data/sessions/{session_id}/images/
 | `timeline.json` | `TimelineItem[]` |
 | `knowledge_graph.json` | `KnowledgeTree` |
 | `post_class_status.json` | 课后后台生成状态、阶段、步骤耗时、warnings 和最终图谱状态 |
+| `qwen_notes_debug.jsonl` | 启用 Qwen 调试日志时记录的模型输入、输出及校验过程，仅保留本地 |
 | `summary.md` | 课后总结，结束课堂后由后台任务生成 |
 | `todos.json` | 课后待办候选，结束课堂后由后台任务生成 |
 | `quiz.json` | 用户主动通过 Agent 生成自测题后保存 |
@@ -1280,10 +1297,10 @@ mock sender 用于在真实 ASR、摄像头/视觉分析和内部知识抽取模
 自动向后端喂一组中文课堂模拟数据。它不会创建课堂；课堂开始必须先从
 前端页面手动发起。
 
-先启动后端：
+先启动开发用前后端（脚本会加载 `.env`）：
 
 ```bash
-.venv/bin/uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+scripts/dev.sh dev
 ```
 
 先在前端点击开始课堂，复制页面上的 `session_id`，然后运行：

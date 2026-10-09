@@ -1,5 +1,9 @@
 # EDU-Mate LLM Provider Setup
 
+首次安装和桌面启动步骤见 [部署指南](DEPLOYMENT_GUIDE.md)。本文只维护模型、
+代理、超时和检索配置。以下供应商示例对应项目现有模板，模型权限、可用性和
+图片能力需在自己的服务账号中确认，不应把示例名称理解为已通过全链路验收。
+
 EDU-Mate uses one backend-only OpenAI-compatible LLM client for Agent skills,
 internal LLM-backed knowledge extraction, the structured-notes knowledge tree
 agent, and optional classroom image analysis. API keys must stay on the backend;
@@ -27,7 +31,7 @@ LLM_PROVIDER=deepseek
 LLM_API_KEY=replace_me
 LLM_MODEL=deepseek-v4-flash
 LLM_BASE_URL=https://api.deepseek.com
-LLM_TIMEOUT_SECONDS=30
+LLM_TIMEOUT_SECONDS=60
 LLM_MAX_RETRIES=1
 LLM_IGNORE_PROXY=1
 NO_PROXY=localhost,127.0.0.1
@@ -45,9 +49,11 @@ For a one-command local app-style run:
 scripts/dev.sh app
 ```
 
-`app` mode runs the first-run LLM check, builds the frontend if `frontend/dist`
-is missing, starts the backend without reload, and serves the built frontend on
-`FRONTEND_PREVIEW_PORT` (default `4173`).
+`app` mode runs the first-run LLM check, builds the frontend when build output
+is missing or source files are newer, starts the backend without reload, and
+serves the frontend on `FRONTEND_PREVIEW_PORT` (default `4173`). It also starts
+WhisperLive and microphone capture by default when the OpenVINO environment is
+available. `dev` starts only the backend and frontend.
 
 Knowledge extraction is LLM-only. If the provider is not configured, EDU-Mate
 will keep transcript, image capture, and classroom saving working, but it will return an
@@ -89,9 +95,13 @@ POST_CLASS_ARTIFACT_LLM_TIMEOUT_SECONDS=45
 POST_CLASS_ARTIFACT_LLM_MAX_RETRIES=0
 ```
 
-The local Qwen final notes stage is controlled separately by
-`POST_CLASS_QWEN_NOTES_TIMEOUT_SECONDS` and related `POST_CLASS_*QWEN*`
-variables.
+The local Qwen final notes stage is controlled separately. With current defaults,
+the backend may first wait up to `POST_CLASS_FINAL_NOTES_WAIT_SECONDS=240` for
+the microphone worker's final notes, then launch a Qwen subprocess with
+`POST_CLASS_QWEN_NOTES_TIMEOUT_SECONDS=360` if no usable final notes exist.
+These are separate waits; a cloud timeout does not bound the entire post-class
+pipeline. Once notes are ready, graph and artifacts run independently, while
+summary and todos still run sequentially inside the artifacts job.
 
 ## Vector RAG / LlamaIndex
 
@@ -146,11 +156,9 @@ the API request.
 
 ## DeepSeek
 
-DeepSeek V4 uses the new model names `deepseek-v4-flash` and
-`deepseek-v4-pro`. Keep the OpenAI-compatible base URL at
-`https://api.deepseek.com`; the backend client appends `/chat/completions`.
-
-Recommended default for realtime classroom extraction:
+The current project template uses `deepseek-v4-flash` and offers
+`deepseek-v4-pro` as an alternative. The backend appends `/chat/completions`
+to the configured base URL. Confirm model access with your provider account.
 
 ```bash
 LLM_PROVIDER=deepseek
@@ -159,7 +167,7 @@ LLM_MODEL=deepseek-v4-flash
 LLM_BASE_URL=https://api.deepseek.com
 ```
 
-Use the higher quality V4 Pro model when latency/cost is less important:
+Alternative template:
 
 ```bash
 LLM_PROVIDER=deepseek
@@ -168,9 +176,8 @@ LLM_MODEL=deepseek-v4-pro
 LLM_BASE_URL=https://api.deepseek.com
 ```
 
-Legacy model names such as `deepseek-chat` and `deepseek-reasoner` are not used
-by the current project examples. Prefer the V4 names above for new local
-configuration unless your provider account documents a different mapping.
+Model names are configuration, not a restriction imposed by the backend. Use
+the exact model identifier supported by your endpoint.
 
 ## Kimi / Moonshot
 
@@ -183,10 +190,25 @@ LLM_MODEL=kimi-k2.6
 LLM_BASE_URL=https://api.moonshot.cn/v1
 ```
 
-`kimi-k2.6` supports multimodal `image_url` input, so it can power
-`/agent/visual/analyze`. Kimi currently rejects non-`1` temperature values for
-this model; EDU-Mate normalizes Kimi/Moonshot requests to `temperature=1`
-automatically.
+The client normalizes requests identified as Kimi/Moonshot to `temperature=1`.
+For image analysis, verify that the selected model and endpoint accept
+`image_url` content; a successful text smoke test does not verify image support.
+
+## Qwen / Other Compatible Providers
+
+For an OpenAI-compatible multimodal endpoint, configure:
+
+```bash
+LLM_PROVIDER=openai_compatible
+LLM_API_KEY=replace_me
+LLM_MODEL=replace_with_your_vision_model
+LLM_BASE_URL=https://your-provider.example/compatible-mode/v1
+```
+
+Replace both placeholders with the model and endpoint assigned by your provider.
+Private deployment URLs and real API keys belong only in `.env`. This changes
+the shared backend provider, including graph and artifact requests; it does not
+replace the local OpenVINO Qwen model that generates classroom notes.
 
 ## OpenAI
 
@@ -216,20 +238,9 @@ LLM_BASE_URL=http://127.0.0.1:11434/v1
 scripts/dev.sh llm-smoke
 ```
 
-Then run a classroom flow:
-
-1. Start backend/frontend with `scripts/dev.sh dev`.
-2. Start or attach to a classroom.
-3. Send `transcript.segment` and `image.capture` events, or run
-   `scripts/dev.sh whisperlive-md --enable-cloud-graph`.
-4. For `/events` extraction, check WebSocket `event.received.data.knowledge_extraction`.
-5. For notes-driven extraction, check the response from
-   `/agent/knowledge-tree/update-from-notes`.
-6. For image analysis, upload/capture an image and call `/agent/visual/analyze`;
-   check the updated `image.capture` and optional `knowledge.extraction`.
-7. Check the following internal `knowledge.extraction` message for `graph_patch`.
-8. On final notes snapshots, check `session.updated` if the cloud model returned
-   `session_title` or `course`.
+This tests configured cloud text calls, not microphone capture, local Qwen or
+image analysis. Follow the acceptance steps in the [deployment guide](DEPLOYMENT_GUIDE.md#8-怎样判断部署成功)
+for the full classroom flow. Detailed event formats live in [API_SCHEMA.md](API_SCHEMA.md).
 
 ## Failure Behavior
 

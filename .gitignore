@@ -5,6 +5,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Local development checklist.
+/Tasks.md
+
 .env
 .env.*
 !.env.example
@@ -15,6 +18,7 @@ data/sessions/*
 data/indexes/
 data/whisperlive_markdown/
 
+# Local competition drafts and supporting materials; not public project docs.
 docs/选题.md
 docs/初选项目设计方案书.odt
 docs/COMPETITION_REPORT_SECTION_2_9_2_11.md
